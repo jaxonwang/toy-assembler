@@ -12,3 +12,6 @@ path = "src/count.rs"
 [dependencies]
 mpi = { version = "0.5"}
 fastq = { version = "0.6"}
+log = "0.4"
+fern = "0.5"
+chrono = "0.4"
