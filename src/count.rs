@@ -21,34 +21,10 @@ use mpi::Threading;
 type CountNumber = u32;
 type KMer = Vec<u8>;
 type CountTable = HashMap<KMer, CountNumber>;
-
-fn all_reads(count_table: &mut CountTable, kmer_len: usize, record: RefRecord) -> bool {
-    let read_slice = Record::seq(&record);
-
-    // drop too short read
-    if read_slice.len() < kmer_len {
-        return true;
-    }
-
-    for start_pos in 0..(read_slice.len() - kmer_len + 1) {
-        let kmer = Vec::from(&read_slice[start_pos..start_pos + kmer_len]);
-
-        update_count_table(count_table, kmer, 1);
-    }
-    return true;
-}
-
-pub fn count_kmers_from_fastq(
-    count_table: &mut CountTable,
-    kmer_len: usize,
-    r: impl io::Read,
-) -> io::Result<()> {
-    let parser = Parser::new(r);
-
-    parser
-        .each(|record| all_reads(count_table, kmer_len, record))
-        .map(|_| ()) // I dont' care the bool in the result
-}
+const BASE_A: u8 = 'A' as u8;
+const BASE_T: u8 = 'T' as u8;
+const BASE_C: u8 = 'C' as u8;
+const BASE_G: u8 = 'G' as u8;
 
 fn partition_by_borders<O: Ord>(kmer: &O, borders: &[O]) -> usize {
     // return i if kmer lies in (borders[i-1], borders[i]]
@@ -73,10 +49,6 @@ fn partition_by_borders<O: Ord>(kmer: &O, borders: &[O]) -> usize {
 mod mpiconst {
     pub const ROOT_RANK: mpi::topology::Rank = 0;
     pub const DONE_MARK: &[u8] = "Done".as_bytes();
-}
-
-struct KmerCounter {
-    kmer_len: usize,
 }
 
 const COUNT_NUMBER_SIZE: usize = std::mem::size_of::<CountNumber>();
@@ -113,7 +85,71 @@ fn update_count_table(count_table: &mut CountTable, kmer: KMer, count: CountNumb
     count_table.insert(kmer, update_count);
 }
 
-impl KmerCounter {
+fn get_reverse_complement(kmer: &KMer) -> KMer {
+    kmer.iter()
+        .rev()
+        .map(|base| match *base {
+            BASE_A => BASE_T,
+            BASE_T => BASE_A,
+            BASE_C => BASE_G,
+            BASE_G => BASE_C,
+            other => panic!(format!("unknown base: {}", other)),
+        })
+        .clone()
+        .collect()
+}
+
+fn get_canonical(kmer: KMer) -> KMer {
+    use std::cmp::Ordering::*;
+    let rev_comp = get_reverse_complement(&kmer);
+    match kmer.cmp(&rev_comp) {
+        Less => rev_comp,
+        Greater => kmer,
+        Equal => panic!("KMer is plalindrome"),
+    }
+}
+
+struct KMerCounter {
+    kmer_len: usize,
+}
+
+impl KMerCounter {
+    pub fn count_kmers_from_fastq(
+        &self,
+        count_table: &mut CountTable,
+        r: impl io::Read,
+    ) -> io::Result<()> {
+        let parser = Parser::new(r);
+
+        parser
+            .each(|record| self.all_reads(count_table, record))
+            .map(|_| ()) // I dont' care the bool in the result
+    }
+
+    fn all_reads(&self, count_table: &mut CountTable, record: RefRecord) -> bool {
+        let read_slice = Record::seq(&record);
+
+        // drop too short read
+        if read_slice.len() < self.kmer_len {
+            return true;
+        }
+        // drop read with unknown base
+        for b in read_slice.iter() {
+            // illumina unknown base
+            if *b == 'N' as u8 || *b == '.' as u8 {
+                return true;
+            }
+        }
+
+        // TODO: further optimization
+        for start_pos in 0..(read_slice.len() - self.kmer_len + 1) {
+            let kmer = Vec::from(&read_slice[start_pos..start_pos + self.kmer_len]);
+
+            update_count_table(count_table, get_canonical(kmer), 1);
+        }
+        return true;
+    }
+
     pub fn distributed_count(&self, count_table: CountTable, world: &SystemCommunicator) {
         let myrank = world.rank();
         let p = world.size();
@@ -186,6 +222,7 @@ impl KmerCounter {
             root_process.send(mpiconst::DONE_MARK);
         }
 
+        // bradcast the border
         debug!("broadcasting borders.");
         for k in borders.iter_mut() {
             root_process.broadcast_into(&mut k[..]);
@@ -197,6 +234,7 @@ impl KmerCounter {
         let local_table = Arc::new(Mutex::new(HashMap::new())); // stores entries partitioned to local
 
         crossbeam::scope(|scope| {
+            // dispatch kemrs by borders
             scope.spawn(|_| self.dispatcher(count_table, world, borders, local_table.clone()));
 
             let mut done = 0;
@@ -223,7 +261,10 @@ impl KmerCounter {
         for (k, v) in guard.iter() {
             update_count_table(&mut new_table, k.clone(), *v);
         }
-        info!("{:?}", &new_table);
+        info!("Count Done");
+        for (k, v) in new_table.iter() {
+            println!("{}: {}", String::from_utf8_lossy(k), v);
+        }
     }
 
     fn dispatcher(
@@ -305,15 +346,27 @@ fn main() {
     let process_id = Arc::new(format!("P{}", world.rank()));
     setup_logger(process_id.clone()).unwrap();
 
-    let counter = KmerCounter { kmer_len: 3 };
+    let counter = KMerCounter { kmer_len: 4 };
     let in1 = "@
 AAATTTCC
 +
 AAAAAEEE
 ";
+    let f = in1.as_bytes();
 
+    // use std::env;
+    // use std::fs;
+    // let fastq_path = match env::args().nth(1) {
+    //     None => {
+    //         println!("usage: a.out file");
+    //         std::process::exit(1)
+    //     }
+    //     Some(p) => p,
+    // };
+    // let f = fs::File::open(fastq_path).unwrap();
+    //
     let mut count_table = HashMap::new();
-    count_kmers_from_fastq(&mut count_table, 3, in1.as_bytes()).unwrap();
+    counter.count_kmers_from_fastq(&mut count_table, f).unwrap();
     counter.distributed_count(count_table, &world);
 }
 
@@ -321,36 +374,42 @@ AAAAAEEE
 mod tests {
     use super::*;
 
+    fn new_kmer(k: &str) -> KMer {
+        k.as_bytes().to_vec()
+    }
+
     #[test]
     fn count_kmers_from_fastq_test() {
         let in1 = "@
-AAATTTCC
+AAATTGCC
 +
 AAAAAEEE
 ";
 
+        let counter = KMerCounter { kmer_len: 6 };
         let mut count_table = HashMap::new();
-        count_kmers_from_fastq(&mut count_table, 6, in1.as_bytes()).unwrap();
-        let out1: CountTable = [("AAATTT", 1), ("AATTTC", 1), ("ATTTCC", 1)]
+        counter
+            .count_kmers_from_fastq(&mut count_table, in1.as_bytes())
+            .unwrap();
+        let out1: CountTable = [("GGCAAT", 1), ("CAATTT", 1), ("GCAATT", 1)]
             .iter()
-            .map(|x| (x.0.as_bytes().to_vec(), x.1))
+            .map(|x| (new_kmer(x.0), x.1))
             .collect();
         assert_eq!(count_table, out1);
 
         let mut count_table = HashMap::new();
-        count_kmers_from_fastq(&mut count_table, 3, in1.as_bytes()).unwrap();
+        let counter = KMerCounter { kmer_len: 3 };
+        counter
+            .count_kmers_from_fastq(&mut count_table, in1.as_bytes())
+            .unwrap();
+        for (k, v) in count_table.iter() {
+            println!("{} {}", String::from_utf8_lossy(k), v);
+        }
 
-        let out1: CountTable = [
-            ("AAT", 1),
-            ("TTC", 1),
-            ("AAA", 1),
-            ("TCC", 1),
-            ("TTT", 1),
-            ("ATT", 1),
-        ]
-        .iter()
-        .map(|x| (x.0.as_bytes().to_vec(), x.1))
-        .collect();
+        let out1: CountTable = [("ATT", 2), ("TGC", 1), ("GGC", 1), ("TTG", 1), ("TTT", 1)]
+            .iter()
+            .map(|x| (new_kmer(x.0), x.1))
+            .collect();
         assert_eq!(count_table, out1);
 
         // for (key, v) in count_table.iter() {
@@ -379,5 +438,11 @@ AAAAAEEE
         let (kmer1, num1) = unpack(buf);
         assert_eq!(num, num1);
         assert_eq!(kmer1, kmer);
+    }
+
+    #[test]
+    fn get_reverse_complement_test() {
+        let k = new_kmer("ATGC");
+        assert_eq!(new_kmer("GCAT"), get_reverse_complement(&k));
     }
 }
