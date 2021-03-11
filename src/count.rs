@@ -62,10 +62,27 @@ fn partition_by_borders<O: Ord>(kmer: &O, borders: &[O]) -> usize {
 }
 
 fn partition_by_hash(kmer: &KMer, partition_num: usize) -> usize {
-    // TODO: locality
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    kmer.hash(&mut hasher);
-    (hasher.finish() % partition_num as u64) as usize
+    let windows_size = kmer.len() - 2; // choose 4 windows
+    if windows_size < 1 {
+        panic!("kmer too short for locality sensitive hashing")
+    }
+    let dohash = |window: &[u8]| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        window.hash(&mut hasher);
+        (hasher.finish() % partition_num as u64) as usize
+    };
+    let mut hashes = vec![];
+    for start in [
+        0usize,
+        1usize,
+        kmer.len() - windows_size - 1,
+        kmer.len() - windows_size,
+    ]
+    .iter()
+    {
+        hashes.push(dohash(&kmer[*start..*start + windows_size]));
+    }
+    *hashes.iter().min().unwrap()
 }
 
 mod mpiconst {
@@ -376,6 +393,7 @@ AAAAAEEE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
     fn new_kmer(k: &str) -> KMer {
         k.as_bytes().to_vec()
@@ -399,7 +417,7 @@ AAAAAEEE
             ("CAATTT", 1, [0, 0, 1, 0, 0, 0, 0, 0]),
             ("GCAATT", 1, [0, 0, 1, 0, 0, 0, 0, 1]),
         ]
-    // number of edges adjcent to a kmer with base [leftA, leftT, leftG, leftC, rightG, rC, rA, rT];
+        // number of edges adjcent to a kmer with base [leftA, leftT, leftG, leftC, rightG, rC, rA, rT];
         .iter()
         .map(|x| {
             (
@@ -458,6 +476,39 @@ AAAAAEEE
         assert_eq!(partition_by_borders(&35, &borders[..]), 2);
         assert_eq!(partition_by_borders(&60, &borders[..]), 4);
         assert_eq!(partition_by_borders(&66, &borders[..]), 5);
+    }
+
+    fn test_locality<F>(hash_func:F) -> i32 where F: Fn(&KMer, usize) -> usize{
+        let mut rng = rand::thread_rng();
+        let read:Vec<u8> = (0..10000).map(|_|rng.gen::<u8>()%4).collect();
+        let mut kmers = vec![];
+        let kmer_len = 31;
+        for i in 0..read.len()-kmer_len{
+            kmers.push(read[i..i+kmer_len].to_vec());
+        }
+        let hashes:Vec<_>= kmers.iter().map(|kmer|hash_func(kmer, 10)).collect();
+        let mut locality_counts = 0;
+        for i in 0..hashes.len()-1{
+            if hashes[i] != hashes[i+1]{
+                locality_counts+=1;
+            }
+        }
+        locality_counts
+    }
+
+    #[test]
+    fn partition_by_hash_test(){
+        let simplehash = |kmer:&KMer, partition_num|{
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            kmer.hash(&mut hasher);
+            (hasher.finish() % partition_num as u64) as usize
+        };
+        let locality_counts1 = test_locality(simplehash);
+        println!("count by hash: {}", locality_counts1);
+        let locality_counts2 = test_locality(partition_by_hash);
+        println!("count by locality hash: {}", locality_counts2);
+        assert!(locality_counts2<locality_counts1);
+
     }
 
     #[test]
