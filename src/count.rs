@@ -1,7 +1,5 @@
 use fastq::{Parser, Record, RefRecord};
 use std::collections::HashMap;
-// use std::env;
-// use std::fs;
 use std::convert::TryFrom;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -61,28 +59,26 @@ fn partition_by_borders<O: Ord>(kmer: &O, borders: &[O]) -> usize {
     return middle;
 }
 
-fn partition_by_hash(kmer: &KMer, partition_num: usize) -> usize {
-    let windows_size = kmer.len() - 2; // choose 4 windows
-    if windows_size < 1 {
-        panic!("kmer too short for locality sensitive hashing")
-    }
+fn _partition_by_hash(kmer: &KMer, partition_num: usize, window_size: usize) -> usize {
     let dohash = |window: &[u8]| {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         window.hash(&mut hasher);
         (hasher.finish() % partition_num as u64) as usize
     };
+
     let mut hashes = vec![];
-    for start in [
-        0usize,
-        1usize,
-        kmer.len() - windows_size - 1,
-        kmer.len() - windows_size,
-    ]
-    .iter()
-    {
-        hashes.push(dohash(&kmer[*start..*start + windows_size]));
+    for start in 0..kmer.len() - window_size {
+        hashes.push(dohash(&kmer[start..start + window_size]));
     }
     *hashes.iter().min().unwrap()
+}
+
+fn partition_by_hash(kmer: &KMer, partition_num: usize) -> usize {
+    let window_size = (kmer.len() as f64).sqrt() as usize; //NOTE:heuristicly choose sqrt
+    if window_size < 1 {
+        panic!("kmer too short for locality sensitive hashing")
+    }
+    _partition_by_hash(kmer, partition_num, window_size)
 }
 
 mod mpiconst {
@@ -366,25 +362,25 @@ fn main() {
     let process_id = Arc::new(format!("P{}", world.rank()));
     setup_logger(process_id.clone()).unwrap();
 
-    let counter = KMerCounter { kmer_len: 3 };
-    let in1 = "@
-AAATTTCC
-+
-AAAAAEEE
-";
-    let f = in1.as_bytes();
+    let counter = KMerCounter { kmer_len: 31 };
+//     let in1 = "@
+// AAATTTCC
+// +
+// AAAAAEEE
+// ";
+//     let f = in1.as_bytes();
 
-    // use std::env;
-    // use std::fs;
-    // let fastq_path = match env::args().nth(1) {
-    //     None => {
-    //         println!("usage: a.out file");
-    //         std::process::exit(1)
-    //     }
-    //     Some(p) => p,
-    // };
-    // let f = fs::File::open(fastq_path).unwrap();
-    //
+    use std::env;
+    use std::fs;
+    let fastq_path = match env::args().nth(1) {
+        None => {
+            println!("usage: a.out file");
+            std::process::exit(1)
+        }
+        Some(p) => p,
+    };
+    let f = fs::File::open(fastq_path).unwrap();
+
     let mut count_table = HashMap::new();
     counter.count_kmers_from_fastq(&mut count_table, f).unwrap();
     counter.distributed_count(count_table, &world);
@@ -478,27 +474,30 @@ AAAAAEEE
         assert_eq!(partition_by_borders(&66, &borders[..]), 5);
     }
 
-    fn test_locality<F>(hash_func:F) -> i32 where F: Fn(&KMer, usize) -> usize{
+    fn test_locality<F>(hash_func: F) -> i32
+    where
+        F: Fn(&KMer, usize) -> usize,
+    {
         let mut rng = rand::thread_rng();
-        let read:Vec<u8> = (0..10000).map(|_|rng.gen::<u8>()%4).collect();
+        let read: Vec<u8> = (0..10000).map(|_| rng.gen::<u8>() % 4).collect();
         let mut kmers = vec![];
         let kmer_len = 31;
-        for i in 0..read.len()-kmer_len{
-            kmers.push(read[i..i+kmer_len].to_vec());
+        for i in 0..read.len() - kmer_len {
+            kmers.push(read[i..i + kmer_len].to_vec());
         }
-        let hashes:Vec<_>= kmers.iter().map(|kmer|hash_func(kmer, 10)).collect();
+        let hashes: Vec<_> = kmers.iter().map(|kmer| hash_func(kmer, 10)).collect();
         let mut locality_counts = 0;
-        for i in 0..hashes.len()-1{
-            if hashes[i] != hashes[i+1]{
-                locality_counts+=1;
+        for i in 0..hashes.len() - 1 {
+            if hashes[i] != hashes[i + 1] {
+                locality_counts += 1;
             }
         }
         locality_counts
     }
 
     #[test]
-    fn partition_by_hash_test(){
-        let simplehash = |kmer:&KMer, partition_num|{
+    fn partition_by_hash_test() {
+        let simplehash = |kmer: &KMer, partition_num| {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             kmer.hash(&mut hasher);
             (hasher.finish() % partition_num as u64) as usize
@@ -507,8 +506,12 @@ AAAAAEEE
         println!("count by hash: {}", locality_counts1);
         let locality_counts2 = test_locality(partition_by_hash);
         println!("count by locality hash: {}", locality_counts2);
-        assert!(locality_counts2<locality_counts1);
-
+        assert!(locality_counts2 * 10 < locality_counts1);
+        // benchmark code
+        // for i in 5..30 {
+        //     let locality_counts2 = test_locality(|a, b| _partition_by_hash(a, b, i));
+        //     println!("{}, {}", i, locality_counts2);
+        // }
     }
 
     #[test]
