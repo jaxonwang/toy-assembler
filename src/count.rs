@@ -93,26 +93,21 @@ union KD {
     bytes: KDBytes,
 }
 
-fn pack(kmer: &KMer, kmer_data: &KMerData) -> Vec<u8> {
-    let mut buf = kmer.clone();
+fn pack(buf: &mut [u8], kmer: &KMer, kmer_data: &KMerData) -> usize {
+    buf[..kmer.len()].copy_from_slice(&kmer[..]);
     let kc = KD {
         kmer_data: kmer_data.clone(),
     };
-    buf.append(&mut Vec::from(unsafe { kc.bytes }));
-    return buf;
+    buf[kmer.len()..kmer.len()+KMER_DATA_SIZE].copy_from_slice(&unsafe { kc.bytes }[..]);
+    return KMER_DATA_SIZE + kmer.len();
 }
 
-fn unpack(buf: &Vec<u8>) -> (KMer, KMerData) {
+fn unpack(buf: &[u8]) -> (KMer, KMerData) {
+    let kmer = buf[..buf.len() - KMER_DATA_SIZE].to_vec();
     let bytes: [u8; KMER_DATA_SIZE] =
         <[u8; KMER_DATA_SIZE]>::try_from(&buf[buf.len() - KMER_DATA_SIZE..]).unwrap();
     let kc = KD { bytes };
-    return (
-        buf.iter()
-            .take(buf.len() - KMER_DATA_SIZE)
-            .cloned()
-            .collect(),
-        unsafe { kc.kmer_data },
-    );
+    return (kmer, unsafe { kc.kmer_data });
 }
 
 fn update_count_table(count_table: &mut CountTable, kmer: KMer, kmerdata: KMerData) {
@@ -255,7 +250,7 @@ impl KMerCounter {
             scope.spawn(|_| self.dispatcher(count_table, world, local_table.clone()));
 
             let mut done = 0;
-            while done != p {
+            while done != p - 1{
                 debug!("try_to receive");
                 let (msg, s) = world.any_process().receive_vec::<u8>();
                 if msg == mpiconst::DONE_MARK {
@@ -263,13 +258,14 @@ impl KMerCounter {
                     debug!("{} Done!", s.source_rank());
                     continue;
                 }
-                let (kmer, kmerdata) = unpack(&msg);
-                // debug!(
-                //     "receive {} from {}",
-                //     String::from_utf8_lossy(&kmer),
-                //     s.source_rank()
-                // );
-                update_count_table(&mut new_table, kmer, kmerdata);
+                let item_size = self.kmer_len + KMER_DATA_SIZE;
+                let mut pos = 0usize;
+                // unpack the msg one by one
+                while pos < msg.len(){
+                    let (kmer, kmerdata) = unpack(&msg[pos..pos+item_size]);
+                    update_count_table(&mut new_table, kmer, kmerdata);
+                    pos += item_size;
+                }
             }
         })
         .unwrap();
@@ -279,9 +275,9 @@ impl KMerCounter {
             update_count_table(&mut new_table, k.clone(), *v);
         }
         info!("Count Done");
-        for (k, v) in new_table.iter() {
-            println!("{}: {:?}", String::from_utf8_lossy(k), v);
-        }
+        // for (k, v) in new_table.iter() {
+        //     println!("{}: {:?}", String::from_utf8_lossy(k), v);
+        // }
     }
 
     fn dispatcher(
@@ -291,6 +287,13 @@ impl KMerCounter {
         local_table: Arc<Mutex<CountTable>>,
     ) {
         let myrank = world.rank();
+        let buffer_size = 140;
+        let item_size = self.kmer_len + KMER_DATA_SIZE;
+        let item_num = buffer_size / item_size;
+        let mut buffers:Vec<(Vec<u8>, usize)> = vec![];
+        for _ in 0..world.size() {
+           buffers.push((vec![0u8; item_size * item_num], 0usize));
+        }
         for (k, v) in count_table.iter() {
             let dst = partition_by_hash(k, world.size() as usize);
             if dst == myrank as usize {
@@ -299,18 +302,28 @@ impl KMerCounter {
                 update_count_table(&mut *guard, k.clone(), *v);
                 continue;
             }
-            let dst_process = world.process_at_rank(dst as mpi::topology::Rank);
-            let msg = pack(k, v);
+            let pos = buffers[dst].1;
+            if pos == buffers[dst].0.len(){
+                let dst_process = world.process_at_rank(dst as mpi::topology::Rank);
+                dst_process.send(&buffers[dst].0[..]); // send full buf
+                // empty buffer
+            }else{
+                pack(&mut buffers[dst].0[pos..pos+item_size], k, v);
+                buffers[dst].1 += item_size;
+            }
+
             // debug!(
             //     "send {} to {}",
             //     String::from_utf8_lossy(&msg),
             //     dst
             // );
-            dst_process.send(&msg[..]);
         }
-        for i in 0..world.size() {
-            world.process_at_rank(i).send(mpiconst::DONE_MARK);
-        }
+        for dst in 0..world.size(){
+            if dst != myrank {
+                world.process_at_rank(dst).send(&buffers[dst as usize].0[0..buffers[dst as usize].1]);
+                world.process_at_rank(dst).send(mpiconst::DONE_MARK);
+            }
+        } 
     }
 }
 
@@ -363,12 +376,12 @@ fn main() {
     setup_logger(process_id.clone()).unwrap();
 
     let counter = KMerCounter { kmer_len: 31 };
-//     let in1 = "@
-// AAATTTCC
-// +
-// AAAAAEEE
-// ";
-//     let f = in1.as_bytes();
+    //     let in1 = "@
+    // AAATTTCC
+    // +
+    // AAAAAEEE
+    // ";
+    //     let f = in1.as_bytes();
 
     use std::env;
     use std::fs;
@@ -521,8 +534,9 @@ AAAAAEEE
             count: 1,
             adj: [1, 2, 3, 4, 5, 6, 7, 8],
         };
-        let buf = pack(&kmer, &data);
-        let (kmer1, data1) = unpack(&buf);
+        let mut buf = vec![0u8; kmer.len()+KMER_DATA_SIZE];
+        pack(&mut buf[..], &kmer, &data);
+        let (kmer1, data1) = unpack(&buf[..]);
         assert_eq!(data, data1);
         assert_eq!(kmer1, kmer);
     }
