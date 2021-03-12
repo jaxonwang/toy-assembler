@@ -1,5 +1,6 @@
+use std::time::Instant;
 use fastq::{Parser, Record, RefRecord};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -98,7 +99,7 @@ fn pack(buf: &mut [u8], kmer: &KMer, kmer_data: &KMerData) -> usize {
     let kc = KD {
         kmer_data: kmer_data.clone(),
     };
-    buf[kmer.len()..kmer.len()+KMER_DATA_SIZE].copy_from_slice(&unsafe { kc.bytes }[..]);
+    buf[kmer.len()..kmer.len() + KMER_DATA_SIZE].copy_from_slice(&unsafe { kc.bytes }[..]);
     return KMER_DATA_SIZE + kmer.len();
 }
 
@@ -168,8 +169,53 @@ fn adj_position(is_left: bool, base: u8) -> usize {
     }
 }
 
+fn adj_base(pos: usize) -> u8 {
+    match pos{
+           0 => BASE_A,
+           1 => BASE_T,
+           2 => BASE_G,
+           3 => BASE_C,
+           4 => BASE_G,
+           5 => BASE_C,
+           6 => BASE_A,
+           7 => BASE_T,
+           _ => panic!("bad pos")
+    }
+}
+
 fn adj_new_edge_with_base(adj: &mut [u32; 8], is_left: bool, base: u8) {
     adj[adj_position(is_left, base)] += 1;
+}
+
+fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, is_left: bool) -> Vec<KMer>{ 
+    // return the out edge bases
+    let range = match is_left{
+        true => 0..4,
+        false => 4..8 
+    };
+    let mut neighbors: Vec<KMer> = vec![];
+    for i in range {
+        if data.adj[i] > 0 {
+            let mut neighbor_kmer:KMer = vec![0u8; kmer.len()];
+            if is_left {
+                neighbor_kmer[1..].copy_from_slice(&kmer[..kmer.len() - 1]);
+                neighbor_kmer[0] = adj_base(i);
+            }else{
+                neighbor_kmer[..kmer.len() - 1].copy_from_slice(&kmer[1..]);
+                neighbor_kmer[kmer.len() - 1] = adj_base(i);
+            }
+            neighbors.push(neighbor_kmer);
+        }
+    }
+    neighbors
+}
+
+fn adj_one_side_degree(adj: &[u32;8], is_left: bool) -> usize {
+    let range = match is_left{
+        true => 0..4,
+        false => 4..8 
+    };
+    adj[range].iter().filter_map(|c| if *c>0 {Some(1)} else {None}).sum()
 }
 
 fn get_canonical(kmer: KMer) -> (KMer, bool) {
@@ -195,6 +241,7 @@ impl KMerCounter {
     ) -> io::Result<()> {
         let parser = Parser::new(r);
 
+        info!("reading file and generating kmers");
         parser
             .each(|record| self.all_reads(count_table, record))
             .map(|_| ()) // I dont' care the bool in the result
@@ -245,14 +292,20 @@ impl KMerCounter {
         let mut new_table: CountTable = HashMap::new();
         let local_table = Arc::new(Mutex::new(HashMap::new())); // stores entries partitioned to local
 
+        let mut mpi_time = 0f64;
+
+        info!("start counting");
+
         crossbeam::scope(|scope| {
             // dispatch kemrs by borders
             scope.spawn(|_| self.dispatcher(count_table, world, local_table.clone()));
 
             let mut done = 0;
-            while done != p - 1{
+            while done != p - 1 {
                 debug!("try_to receive");
+                let start = Instant::now();
                 let (msg, s) = world.any_process().receive_vec::<u8>();
+                mpi_time += (Instant::now() - start).as_secs_f64();
                 if msg == mpiconst::DONE_MARK {
                     done += 1;
                     debug!("{} Done!", s.source_rank());
@@ -261,8 +314,8 @@ impl KMerCounter {
                 let item_size = self.kmer_len + KMER_DATA_SIZE;
                 let mut pos = 0usize;
                 // unpack the msg one by one
-                while pos < msg.len(){
-                    let (kmer, kmerdata) = unpack(&msg[pos..pos+item_size]);
+                while pos < msg.len() {
+                    let (kmer, kmerdata) = unpack(&msg[pos..pos + item_size]);
                     update_count_table(&mut new_table, kmer, kmerdata);
                     pos += item_size;
                 }
@@ -274,7 +327,7 @@ impl KMerCounter {
         for (k, v) in guard.iter() {
             update_count_table(&mut new_table, k.clone(), *v);
         }
-        info!("Count Done: kmers number {}", new_table.len());
+        info!("Count Done: kmers number {}, mpi recv time {}", new_table.len(), mpi_time);
         // for (k, v) in new_table.iter() {
         //     println!("{}: {:?}", String::from_utf8_lossy(k), v);
         // }
@@ -287,13 +340,15 @@ impl KMerCounter {
         local_table: Arc<Mutex<CountTable>>,
     ) {
         let myrank = world.rank();
-        let buffer_size = 140;
+        let buffer_size = 100;
         let item_size = self.kmer_len + KMER_DATA_SIZE;
         let item_num = buffer_size / item_size;
-        let mut buffers:Vec<(Vec<u8>, usize)> = vec![];
+        let mut mpi_time = 0f64;
+        let mut buffers: Vec<(Vec<u8>, usize)> = vec![];
         for _ in 0..world.size() {
-           buffers.push((vec![0u8; item_size * item_num], 0usize));
+            buffers.push((vec![0u8; item_size * item_num], 0usize));
         }
+
         for (k, v) in count_table.iter() {
             let dst = partition_by_hash(k, world.size() as usize);
             if dst == myrank as usize {
@@ -303,12 +358,14 @@ impl KMerCounter {
                 continue;
             }
             let pos = buffers[dst].1;
-            if pos == buffers[dst].0.len(){
+            if pos == buffers[dst].0.len() {
                 let dst_process = world.process_at_rank(dst as mpi::topology::Rank);
+                let start = Instant::now();
                 dst_process.send(&buffers[dst].0[..]); // send full buf
-                // empty buffer
-            }else{
-                pack(&mut buffers[dst].0[pos..pos+item_size], k, v);
+                mpi_time += (Instant::now() - start).as_secs_f64();
+                                                       // empty buffer
+            } else {
+                pack(&mut buffers[dst].0[pos..pos + item_size], k, v);
                 buffers[dst].1 += item_size;
             }
 
@@ -318,13 +375,49 @@ impl KMerCounter {
             //     dst
             // );
         }
-        for dst in 0..world.size(){
+        for dst in 0..world.size() {
             if dst != myrank {
-                world.process_at_rank(dst).send(&buffers[dst as usize].0[0..buffers[dst as usize].1]);
+                let start = Instant::now();
+                world
+                    .process_at_rank(dst)
+                    .send(&buffers[dst as usize].0[0..buffers[dst as usize].1]);
                 world.process_at_rank(dst).send(mpiconst::DONE_MARK);
+                mpi_time += (Instant::now() - start).as_secs_f64();
             }
-        } 
+        }
+        info!("dispatch done, mpi send time {}", mpi_time);
     }
+}
+
+// struct LinearPath{
+//     start: &KMer,
+//     end: &KMer,
+//     length: usize
+// }
+
+struct KMerDataExtend{
+    node: KMerData,
+    marks: u8
+}
+
+// type KMerTable = HashMap<KMer, KMerDataExtend>;
+
+fn local_linear_path(kmers_from_counter:CountTable, kmer_len:usize) {
+    let mut visited = HashSet::new();
+
+    // try connect kmers
+    for (k,v) in kmers_from_counter.iter(){
+        if visited.contains(k) {
+            continue;
+        }
+        visited.insert(k.clone()); // mark as visited
+        // extend right
+        while adj_one_side_degree(&v.adj, false) == 1 {
+            let extend = kmer_side_neighbor(k, v, false);
+        }
+    }
+
+
 }
 
 // pub fn main() {
@@ -499,7 +592,10 @@ AAAAAEEE
         for i in 0..read.len() - kmer_len {
             kmers.push(read[i..i + kmer_len].to_vec());
         }
-        let hashes: Vec<usize> = kmers.iter().map(|kmer| hash_func(kmer, partition_num)).collect();
+        let hashes: Vec<usize> = kmers
+            .iter()
+            .map(|kmer| hash_func(kmer, partition_num))
+            .collect();
         let mut locality_counts = 0;
         for i in 0..hashes.len() - 1 {
             if hashes[i] != hashes[i + 1] {
@@ -508,10 +604,13 @@ AAAAAEEE
         }
 
         let mut balance_count = vec![0usize; partition_num];
-        hashes.iter().map(|p|balance_count[*p]+=1).collect::<()>();
-        let mean = (balance_count.iter().sum::<usize>() / partition_num) as f64; 
-        let mut v1 =0f64;
-        for i in hashes.iter(){
+        hashes
+            .iter()
+            .map(|p| balance_count[*p] += 1)
+            .collect::<()>();
+        let mean = (balance_count.iter().sum::<usize>() / partition_num) as f64;
+        let mut v1 = 0f64;
+        for i in hashes.iter() {
             v1 += (mean - *i as f64) * (mean - *i as f64);
         }
         let variance = v1.sqrt() / (partition_num - 1) as f64;
@@ -544,7 +643,7 @@ AAAAAEEE
             count: 1,
             adj: [1, 2, 3, 4, 5, 6, 7, 8],
         };
-        let mut buf = vec![0u8; kmer.len()+KMER_DATA_SIZE];
+        let mut buf = vec![0u8; kmer.len() + KMER_DATA_SIZE];
         pack(&mut buf[..], &kmer, &data);
         let (kmer1, data1) = unpack(&buf[..]);
         assert_eq!(data, data1);
@@ -555,5 +654,25 @@ AAAAAEEE
     fn get_reverse_complement_test() {
         let k = new_kmer("ATGC");
         assert_eq!(new_kmer("GCAT"), get_reverse_complement(&k));
+    }
+
+    #[test]
+    fn adj_one_side_degree_test(){
+        let adj = [4u32, 0, 0, 0, 0, 3, 0, 6];
+        assert_eq!(adj_one_side_degree(&adj, true), 1);
+        assert_eq!(adj_one_side_degree(&adj, false), 2);
+        let adj = [0u32, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(adj_one_side_degree(&adj, true), 0);
+        assert_eq!(adj_one_side_degree(&adj, false), 0);
+    }
+
+    #[test]
+    fn kmer_side_neighbor_test() {
+        let kmer = new_kmer("ATCGATCG");
+        let data = KMerData{adj: [1,0,1,0,0,1,0,1], count: 2};
+        let l = kmer_side_neighbor(&kmer, &data, true);
+        let r = kmer_side_neighbor(&kmer, &data, false);
+        assert_eq!(l, vec![new_kmer("AATCGATC"), new_kmer("GATCGATC")]);
+        assert_eq!(r, vec![new_kmer("TCGATCGC"), new_kmer("TCGATCGT")]);
     }
 }
