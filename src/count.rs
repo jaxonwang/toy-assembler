@@ -1,11 +1,12 @@
-use std::time::Instant;
 use fastq::{Parser, Record, RefRecord};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
+use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 extern crate chrono;
 extern crate crossbeam;
@@ -22,6 +23,10 @@ use mpi::Threading;
 type CountNumber = u32;
 type KMer = Vec<u8>;
 
+fn kmer_str(k: &KMer) -> String {
+    String::from_utf8_lossy(&k[..]).to_string()
+}
+
 #[derive(Debug, Copy, Clone, Eq)]
 struct KMerData {
     adj: [u32; 8], // number of edges adjcent to a kmer with base [leftA, leftT, leftG, leftC, rightG, rC, rA, rT];
@@ -35,10 +40,10 @@ impl PartialEq for KMerData {
 
 type CountTable = HashMap<KMer, KMerData>;
 
-const BASE_A: u8 = 'A' as u8;
-const BASE_T: u8 = 'T' as u8;
-const BASE_C: u8 = 'C' as u8;
-const BASE_G: u8 = 'G' as u8;
+const BASE_A: u8 = b'A';
+const BASE_T: u8 = b'T';
+const BASE_C: u8 = b'C';
+const BASE_G: u8 = b'G';
 
 fn partition_by_borders<O: Ord>(kmer: &O, borders: &[O]) -> usize {
     // return i if kmer lies in (borders[i-1], borders[i]]
@@ -57,7 +62,7 @@ fn partition_by_borders<O: Ord>(kmer: &O, borders: &[O]) -> usize {
     if i == middle + 1 && i >= j {
         return i;
     }
-    return middle;
+    middle
 }
 
 fn _partition_by_hash(kmer: &KMer, partition_num: usize, window_size: usize) -> usize {
@@ -97,10 +102,10 @@ union KD {
 fn pack(buf: &mut [u8], kmer: &KMer, kmer_data: &KMerData) -> usize {
     buf[..kmer.len()].copy_from_slice(&kmer[..]);
     let kc = KD {
-        kmer_data: kmer_data.clone(),
+        kmer_data: *kmer_data,
     };
     buf[kmer.len()..kmer.len() + KMER_DATA_SIZE].copy_from_slice(&unsafe { kc.bytes }[..]);
-    return KMER_DATA_SIZE + kmer.len();
+    KMER_DATA_SIZE + kmer.len()
 }
 
 fn unpack(buf: &[u8]) -> (KMer, KMerData) {
@@ -108,7 +113,7 @@ fn unpack(buf: &[u8]) -> (KMer, KMerData) {
     let bytes: [u8; KMER_DATA_SIZE] =
         <[u8; KMER_DATA_SIZE]>::try_from(&buf[buf.len() - KMER_DATA_SIZE..]).unwrap();
     let kc = KD { bytes };
-    return (kmer, unsafe { kc.kmer_data });
+    (kmer, unsafe { kc.kmer_data })
 }
 
 fn update_count_table(count_table: &mut CountTable, kmer: KMer, kmerdata: KMerData) {
@@ -126,16 +131,20 @@ fn update_count_table(count_table: &mut CountTable, kmer: KMer, kmerdata: KMerDa
     };
 }
 
+fn get_complement_base(base: u8) -> u8 {
+    match base {
+        BASE_A => BASE_T,
+        BASE_T => BASE_A,
+        BASE_C => BASE_G,
+        BASE_G => BASE_C,
+        other => panic!(format!("unknown base: {}", other)),
+    }
+}
+
 fn get_reverse_complement(kmer: &KMer) -> KMer {
     kmer.iter()
         .rev()
-        .map(|base| match *base {
-            BASE_A => BASE_T,
-            BASE_T => BASE_A,
-            BASE_C => BASE_G,
-            BASE_G => BASE_C,
-            other => panic!(format!("unknown base: {}", other)),
-        })
+        .map(|x| get_complement_base(*x))
         .clone()
         .collect()
 }
@@ -170,16 +179,16 @@ fn adj_position(is_left: bool, base: u8) -> usize {
 }
 
 fn adj_base(pos: usize) -> u8 {
-    match pos{
-           0 => BASE_A,
-           1 => BASE_T,
-           2 => BASE_G,
-           3 => BASE_C,
-           4 => BASE_G,
-           5 => BASE_C,
-           6 => BASE_A,
-           7 => BASE_T,
-           _ => panic!("bad pos")
+    match pos {
+        0 => BASE_A,
+        1 => BASE_T,
+        2 => BASE_G,
+        3 => BASE_C,
+        4 => BASE_G,
+        5 => BASE_C,
+        6 => BASE_A,
+        7 => BASE_T,
+        _ => panic!("bad pos"),
     }
 }
 
@@ -187,20 +196,20 @@ fn adj_new_edge_with_base(adj: &mut [u32; 8], is_left: bool, base: u8) {
     adj[adj_position(is_left, base)] += 1;
 }
 
-fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, is_left: bool) -> Vec<KMer>{ 
+fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, is_left: bool) -> Vec<KMer> {
     // return the out edge bases
-    let range = match is_left{
+    let range = match is_left {
         true => 0..4,
-        false => 4..8 
+        false => 4..8,
     };
     let mut neighbors: Vec<KMer> = vec![];
     for i in range {
         if data.adj[i] > 0 {
-            let mut neighbor_kmer:KMer = vec![0u8; kmer.len()];
+            let mut neighbor_kmer: KMer = vec![0u8; kmer.len()];
             if is_left {
                 neighbor_kmer[1..].copy_from_slice(&kmer[..kmer.len() - 1]);
                 neighbor_kmer[0] = adj_base(i);
-            }else{
+            } else {
                 neighbor_kmer[..kmer.len() - 1].copy_from_slice(&kmer[1..]);
                 neighbor_kmer[kmer.len() - 1] = adj_base(i);
             }
@@ -210,12 +219,15 @@ fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, is_left: bool) -> Vec<KMer>{
     neighbors
 }
 
-fn adj_one_side_degree(adj: &[u32;8], is_left: bool) -> usize {
-    let range = match is_left{
+fn adj_one_side_degree(adj: &[u32; 8], is_left: bool) -> usize {
+    let range = match is_left {
         true => 0..4,
-        false => 4..8 
+        false => 4..8,
     };
-    adj[range].iter().filter_map(|c| if *c>0 {Some(1)} else {None}).sum()
+    adj[range]
+        .iter()
+        .filter_map(|c| if *c > 0 { Some(1) } else { None })
+        .sum()
 }
 
 fn get_canonical(kmer: KMer) -> (KMer, bool) {
@@ -257,7 +269,7 @@ impl KMerCounter {
         // drop read with unknown base
         for b in read.iter() {
             // illumina unknown base
-            if *b == 'N' as u8 || *b == '.' as u8 {
+            if *b == b'N' || *b == b'.' {
                 return true;
             }
         }
@@ -283,7 +295,7 @@ impl KMerCounter {
 
             update_count_table(count_table, canonical, kmer_data);
         }
-        return true;
+        true
     }
 
     pub fn distributed_count(&self, count_table: CountTable, world: &SystemCommunicator) {
@@ -327,7 +339,11 @@ impl KMerCounter {
         for (k, v) in guard.iter() {
             update_count_table(&mut new_table, k.clone(), *v);
         }
-        info!("Count Done: kmers number {}, mpi recv time {}", new_table.len(), mpi_time);
+        info!(
+            "Count Done: kmers number {}, mpi recv time {}",
+            new_table.len(),
+            mpi_time
+        );
         // for (k, v) in new_table.iter() {
         //     println!("{}: {:?}", String::from_utf8_lossy(k), v);
         // }
@@ -363,7 +379,7 @@ impl KMerCounter {
                 let start = Instant::now();
                 dst_process.send(&buffers[dst].0[..]); // send full buf
                 mpi_time += (Instant::now() - start).as_secs_f64();
-                                                       // empty buffer
+                // empty buffer
             } else {
                 pack(&mut buffers[dst].0[pos..pos + item_size], k, v);
                 buffers[dst].1 += item_size;
@@ -389,35 +405,134 @@ impl KMerCounter {
     }
 }
 
-// struct LinearPath{
-//     start: &KMer,
-//     end: &KMer,
-//     length: usize
-// }
+struct LinearPath {
+    path: Vec<u8>,
+    coverage: u32,
+}
 
-struct KMerDataExtend{
+struct KMerDataExtend {
     node: KMerData,
-    marks: u8
+    marks: u8,
 }
 
 // type KMerTable = HashMap<KMer, KMerDataExtend>;
 
-fn local_linear_path(kmers_from_counter:CountTable, kmer_len:usize) {
+fn local_linear_path(kmers_from_counter: CountTable) -> Vec<LinearPath> {
     let mut visited = HashSet::new();
+    let mut linear_paths: Vec<LinearPath> = vec![];
 
+    for (k, _) in kmers_from_counter.iter() {
+        println!("{} ", kmer_str(k));
+    }
     // try connect kmers
-    for (k,v) in kmers_from_counter.iter(){
-        if visited.contains(k) {
+    for (k, v) in kmers_from_counter.iter() {
+        // extend right
+        let is_linear = |x| {
+            adj_one_side_degree(&kmers_from_counter[x].adj, false) == 1
+                && adj_one_side_degree(&kmers_from_counter[x].adj, true) == 1
+        };
+        println!("look at {} ", kmer_str(k));
+
+        let mut travel = |is_left| -> Vec<&KMer> {
+            let mut side_path: Vec<&KMer> = vec![];
+            let mut current: &KMer = k;
+            let mut direction = is_left;
+            // extend to one direction
+            while is_linear(current) {
+                println!(", {}", kmer_str(current));
+                side_path.push(current);
+                // TODO: clone here
+                let current_data: &KMerData = kmers_from_counter.get(k).unwrap();
+                let sj = current_data.adj.iter().enumerate().map(|(i, v)| match *v > 0 {
+                    true => adj_base(i),
+                    false => b'-'
+                }).collect();
+                println!("is_left:{} , {}", direction, kmer_str(&sj));
+                let (ref extend, changed) =
+                    get_canonical(kmer_side_neighbor(current, current_data, direction)[0].clone());
+                if changed { // change to it reverse complement, to go the same direction, need change
+                    direction = !direction;
+                }
+                println!("extend, {}", kmer_str(extend));
+                if kmers_from_counter.contains_key(extend) {
+                    // is local
+                    if visited.contains(extend) {
+                        #[allow(dead_code)]
+                        if *current == *k {
+                            // found a ring
+                            // panic!("got a ring");
+                        }
+                        println!("visisted, {}", kmer_str(extend));
+                        break;
+                    }
+                    current = kmers_from_counter.get_key_value(extend).unwrap().0;
+                    visited.insert(current.clone()); // now k is linear && not visited. mark as visited.
+                }else{
+                    panic!("fff");
+
+                }
+            }
+            side_path
+        };
+
+        let rpath = travel(false);
+        println!("to left");
+        let lpath = travel(true); //extend left
+
+        let mut path: Vec<u8> = vec![];
+        let mut coverage = 0u32;
+
+        if lpath.len() == 0 {
             continue;
         }
-        visited.insert(k.clone()); // mark as visited
-        // extend right
-        while adj_one_side_degree(&v.adj, false) == 1 {
-            let extend = kmer_side_neighbor(k, v, false);
-        }
+        // try to use left most as a start, recover and then get canonical
+        let left_most_kmer = lpath[lpath.len() - 1];
+        path.extend_from_slice(&left_most_kmer[..]);
+        let mut last_base: u8 = *left_most_kmer.last().unwrap();
+
+        coverage += connect_kmer(
+            (0..lpath.len() - 1).rev(),
+            &lpath,
+            &mut last_base,
+            &kmers_from_counter,
+            &mut path,
+        );
+        coverage += connect_kmer(
+            1..rpath.len() - 1,
+            &lpath,
+            &mut last_base,
+            &kmers_from_counter,
+            &mut path,
+        );
+        path = get_canonical(path).0;
+
+        linear_paths.push(LinearPath { path, coverage });
     }
+    linear_paths
+}
 
+fn connect_kmer<T: Iterator<Item = usize>>(
+    iter: T,
+    side_path: &[&KMer],
+    last_base: &mut u8,
+    kmers_from_counter: &CountTable,
+    path: &mut Vec<u8>,
+) -> u32 {
+    let mut coverage = 0u32;
 
+    for i in iter {
+        let next_kmer: &KMer = side_path[i];
+        let next_base = *next_kmer.last().unwrap();
+        let next_base = match *last_base == next_kmer[next_kmer.len() - 2] {
+            true => next_base,
+            false => get_complement_base(next_base),
+        };
+        path.push(next_base);
+        *last_base = next_base;
+
+        coverage += kmers_from_counter[next_kmer].count;
+    }
+    coverage
 }
 
 // pub fn main() {
@@ -466,7 +581,7 @@ fn main() {
     let world = universe.world();
 
     let process_id = Arc::new(format!("P{}", world.rank()));
-    setup_logger(process_id.clone()).unwrap();
+    setup_logger(process_id).unwrap();
 
     let counter = KMerCounter { kmer_len: 31 };
     //     let in1 = "@
@@ -538,9 +653,6 @@ AAAAAEEE
         counter
             .count_kmers_from_fastq(&mut count_table, in1.as_bytes())
             .unwrap();
-        for (k, v) in count_table.iter() {
-            println!("{} {:?}", String::from_utf8_lossy(k), v);
-        }
 
         let out1: CountTable = [
             ("ATT", 2, [2, 0, 0, 0, 1, 0, 0, 1]),
@@ -604,10 +716,7 @@ AAAAAEEE
         }
 
         let mut balance_count = vec![0usize; partition_num];
-        hashes
-            .iter()
-            .map(|p| balance_count[*p] += 1)
-            .collect::<()>();
+        hashes.iter().for_each(|p| balance_count[*p] += 1);
         let mean = (balance_count.iter().sum::<usize>() / partition_num) as f64;
         let mut v1 = 0f64;
         for i in hashes.iter() {
@@ -625,9 +734,9 @@ AAAAAEEE
             (hasher.finish() % partition_num as u64) as usize
         };
         let (locality_counts1, var1) = test_locality(simplehash);
-        println!("count by hash: {} {}", locality_counts1, var1);
+        // println!("count by hash: {} {}", locality_counts1, var1);
         let (locality_counts2, var2) = test_locality(partition_by_hash);
-        println!("count by locality hash: {} {}", locality_counts2, var2);
+        // println!("count by locality hash: {} {}", locality_counts2, var2);
         assert!(locality_counts2 * 10 < locality_counts1);
         // benchmark code
         // for i in 5..30 {
@@ -657,7 +766,7 @@ AAAAAEEE
     }
 
     #[test]
-    fn adj_one_side_degree_test(){
+    fn adj_one_side_degree_test() {
         let adj = [4u32, 0, 0, 0, 0, 3, 0, 6];
         assert_eq!(adj_one_side_degree(&adj, true), 1);
         assert_eq!(adj_one_side_degree(&adj, false), 2);
@@ -669,10 +778,35 @@ AAAAAEEE
     #[test]
     fn kmer_side_neighbor_test() {
         let kmer = new_kmer("ATCGATCG");
-        let data = KMerData{adj: [1,0,1,0,0,1,0,1], count: 2};
+        let data = KMerData {
+            adj: [1, 0, 1, 0, 0, 1, 0, 1],
+            count: 2,
+        };
         let l = kmer_side_neighbor(&kmer, &data, true);
         let r = kmer_side_neighbor(&kmer, &data, false);
         assert_eq!(l, vec![new_kmer("AATCGATC"), new_kmer("GATCGATC")]);
         assert_eq!(r, vec![new_kmer("TCGATCGC"), new_kmer("TCGATCGT")]);
+    }
+
+    #[test]
+    fn local_linear_path_test() {
+        /*
+CGAATCTGACCGTGTTTAAT
+*/
+        let in1 = "@
+ATTAAACACGGTCAGATTCG
++
+AAAAAEEEEEEEEEEEEEEE
+";
+
+        let counter = KMerCounter { kmer_len: 11 };
+        let mut count_table: CountTable = HashMap::new();
+        counter
+            .count_kmers_from_fastq(&mut count_table, in1.as_bytes())
+            .unwrap();
+        let paths = local_linear_path(count_table);
+        for i in paths {
+            println!("{}, {}", String::from_utf8_lossy(&i.path[..]), i.coverage);
+        }
     }
 }
