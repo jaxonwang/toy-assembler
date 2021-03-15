@@ -1,7 +1,6 @@
 use fastq::{Parser, Record, RefRecord};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io;
@@ -410,129 +409,114 @@ struct LinearPath {
     coverage: u32,
 }
 
-struct KMerDataExtend {
-    node: KMerData,
-    marks: u8,
+fn adj_str(adj: &[u32; 8]) -> String {
+    let sj = adj
+        .iter()
+        .enumerate()
+        .map(|(i, v)| match *v > 0 {
+            true => adj_base(i),
+            false => b'-',
+        })
+        .collect();
+    kmer_str(&sj)
 }
 
 // type KMerTable = HashMap<KMer, KMerDataExtend>;
 
-fn local_linear_path(kmers_from_counter: CountTable) -> Vec<LinearPath> {
+fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> Vec<LinearPath> {
     let mut visited = HashSet::new();
     let mut linear_paths: Vec<LinearPath> = vec![];
 
-    for (k, _) in kmers_from_counter.iter() {
-        println!("{} ", kmer_str(k));
-    }
     // try connect kmers
-    for (k, v) in kmers_from_counter.iter() {
+    for k in kmers_from_counter.keys() {
         // extend right
         let is_linear = |x| {
-            adj_one_side_degree(&kmers_from_counter[x].adj, false) == 1
-                && adj_one_side_degree(&kmers_from_counter[x].adj, true) == 1
+            adj_one_side_degree(&kmers_from_counter[x].adj, false)
+                + adj_one_side_degree(&kmers_from_counter[x].adj, true)
+                <= 2
         };
-        println!("look at {} ", kmer_str(k));
+        if visited.contains(k) {
+            continue;
+        }
 
-        let mut travel = |is_left| -> Vec<&KMer> {
-            let mut side_path: Vec<&KMer> = vec![];
+        let mut travel = |is_left| -> Vec<(u8, u32)> {
+            let mut side_path: Vec<(u8, u32)> = vec![]; // base, count
             let mut current: &KMer = k;
             let mut direction = is_left;
             // extend to one direction
-            while is_linear(current) {
-                println!(", {}", kmer_str(current));
-                side_path.push(current);
+            while !visited.contains(current) && is_linear(current) {
+                visited.insert(current.clone()); // now k is linear && not visited. mark as visited.
+                let base;
+                if is_left {
+                    if direction == is_left {
+                        base = current[0];
+                    } else {
+                        base = get_complement_base(current[kmer_len - 1]);
+                    }
+                } else {
+                    if direction == is_left {
+                        base = current[kmer_len - 1];
+                    } else {
+                        base = get_complement_base(current[0]);
+                    }
+                }
                 // TODO: clone here
-                let current_data: &KMerData = kmers_from_counter.get(k).unwrap();
-                let sj = current_data.adj.iter().enumerate().map(|(i, v)| match *v > 0 {
-                    true => adj_base(i),
-                    false => b'-'
-                }).collect();
-                println!("is_left:{} , {}", direction, kmer_str(&sj));
-                let (ref extend, changed) =
-                    get_canonical(kmer_side_neighbor(current, current_data, direction)[0].clone());
-                if changed { // change to it reverse complement, to go the same direction, need change
+                let current_data: &KMerData = kmers_from_counter.get(current).unwrap();
+                side_path.push((base, current_data.count));
+                let mut neighbor = kmer_side_neighbor(current, current_data, direction);
+                match neighbor.len() {
+                    0 => break, // this is an end
+                    1 => (),
+                    n => panic!(format!("impossible degree {}", n)),
+                }
+                let neighbor = neighbor.pop().unwrap();
+                let (ref extend, changed) = get_canonical(neighbor);
+                if changed {
+                    // change to it reverse complement, to go the same direction, need change
                     direction = !direction;
                 }
-                println!("extend, {}", kmer_str(extend));
                 if kmers_from_counter.contains_key(extend) {
                     // is local
-                    if visited.contains(extend) {
-                        #[allow(dead_code)]
-                        if *current == *k {
-                            // found a ring
-                            // panic!("got a ring");
-                        }
-                        println!("visisted, {}", kmer_str(extend));
-                        break;
-                    }
                     current = kmers_from_counter.get_key_value(extend).unwrap().0;
-                    visited.insert(current.clone()); // now k is linear && not visited. mark as visited.
-                }else{
-                    panic!("fff");
-
-                }
+                } 
+            }
+            if !is_left {
+                visited.remove(k); // remove for left travel enabled
             }
             side_path
         };
 
         let rpath = travel(false);
-        println!("to left");
         let lpath = travel(true); //extend left
 
-        let mut path: Vec<u8> = vec![];
-        let mut coverage = 0u32;
-
         if lpath.len() == 0 {
-            continue;
+            continue; // nothing to do for this kmer
         }
-        // try to use left most as a start, recover and then get canonical
-        let left_most_kmer = lpath[lpath.len() - 1];
-        path.extend_from_slice(&left_most_kmer[..]);
-        let mut last_base: u8 = *left_most_kmer.last().unwrap();
 
-        coverage += connect_kmer(
-            (0..lpath.len() - 1).rev(),
-            &lpath,
-            &mut last_base,
-            &kmers_from_counter,
-            &mut path,
-        );
-        coverage += connect_kmer(
-            1..rpath.len() - 1,
-            &lpath,
-            &mut last_base,
-            &kmers_from_counter,
-            &mut path,
-        );
+        let mut path: Vec<u8> = vec![0; lpath.len() + rpath.len() - 2 + k.len()];
+        // init as middle
+        let mut coverage = lpath.last().unwrap().1;
+        let lpath_len = lpath.len();
+        // must use k(middle) as start, orthewise we don't know direction to continue
+        path[lpath_len - 1..lpath_len + kmer_len - 1].copy_from_slice(&k[..]);
+
+        // connect left
+        for i in 1..lpath_len {
+            let (base, count) = lpath[i];
+            path[lpath_len - i - 1] = base;
+            coverage += count;
+        }
+        // connect right
+        for i in 1..rpath.len() {
+            let (base, count) = rpath[i];
+            path[lpath_len + kmer_len - 2 + i] = base;
+            coverage += count;
+        }
         path = get_canonical(path).0;
 
         linear_paths.push(LinearPath { path, coverage });
     }
     linear_paths
-}
-
-fn connect_kmer<T: Iterator<Item = usize>>(
-    iter: T,
-    side_path: &[&KMer],
-    last_base: &mut u8,
-    kmers_from_counter: &CountTable,
-    path: &mut Vec<u8>,
-) -> u32 {
-    let mut coverage = 0u32;
-
-    for i in iter {
-        let next_kmer: &KMer = side_path[i];
-        let next_base = *next_kmer.last().unwrap();
-        let next_base = match *last_base == next_kmer[next_kmer.len() - 2] {
-            true => next_base,
-            false => get_complement_base(next_base),
-        };
-        path.push(next_base);
-        *last_base = next_base;
-
-        coverage += kmers_from_counter[next_kmer].count;
-    }
-    coverage
 }
 
 // pub fn main() {
@@ -733,9 +717,9 @@ AAAAAEEE
             kmer.hash(&mut hasher);
             (hasher.finish() % partition_num as u64) as usize
         };
-        let (locality_counts1, var1) = test_locality(simplehash);
+        let (locality_counts1, _var1) = test_locality(simplehash);
         // println!("count by hash: {} {}", locality_counts1, var1);
-        let (locality_counts2, var2) = test_locality(partition_by_hash);
+        let (locality_counts2, _var2) = test_locality(partition_by_hash);
         // println!("count by locality hash: {} {}", locality_counts2, var2);
         assert!(locality_counts2 * 10 < locality_counts1);
         // benchmark code
@@ -790,23 +774,39 @@ AAAAAEEE
 
     #[test]
     fn local_linear_path_test() {
-        /*
-CGAATCTGACCGTGTTTAAT
-*/
-        let in1 = "@
+        let test = |in_seq: &str, kmer_len| {
+            let counter = KMerCounter { kmer_len };
+            let mut count_table: CountTable = HashMap::new();
+            counter
+                .count_kmers_from_fastq(&mut count_table, in_seq.as_bytes())
+                .unwrap();
+            for (_, v) in count_table.iter() {
+                assert_eq!(v.count, 1);
+            }
+            let paths = local_linear_path(count_table, counter.kmer_len);
+            let seq = get_canonical(in_seq.split('\n').nth(1).unwrap().as_bytes().to_vec()).0;
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].path, seq);
+            assert_eq!(paths[0].coverage as usize, seq.len() - counter.kmer_len + 1);
+        };
+        let in_seq1 = "@
 ATTAAACACGGTCAGATTCG
 +
 AAAAAEEEEEEEEEEEEEEE
 ";
 
-        let counter = KMerCounter { kmer_len: 11 };
-        let mut count_table: CountTable = HashMap::new();
-        counter
-            .count_kmers_from_fastq(&mut count_table, in1.as_bytes())
-            .unwrap();
-        let paths = local_linear_path(count_table);
-        for i in paths {
-            println!("{}, {}", String::from_utf8_lossy(&i.path[..]), i.coverage);
-        }
+        let in_seq2 = "@
+ATATTGCACAGGTGGCAAACTCCAACTGTTTCTTACGGTTTTATCGCAACCGGCAAATCCAGATTTTTCAGTATTTACACAAAGGGAGAGGGATTCTCTTTGTTAAAAAGTGACCATACCCGATGTCGTGCCCGGGTCAGCGCCACGTACA
++
+AAAAAEEE/AEAE66EEEE//E/E/EAAEEE<//AEE/EEA//<AE//E<E//EE/EEEEEE//</AA6EEEEEEA//E/AEEEA/<AE/EEEAE66</EE/E/E<E/EAEA//6/EE</E/<6////E<E66/EAE///<<AEE<A<A/A
+";
+        let in_seq3 = "@
+ATTAAACACGGTCAGATTCGGATCGGTTTTATGCAGCGCATCCAGCTCCGGCGTGGTTTCACGCGGATAACCGTACAGACTCATGCGGCCACGCTGGGTCGACTCGCCAATCACCAGCACTAAGGTGCGCGGTTCGTTACCCGATTCAT
++
+AAAAAEEEEEEEEEEEEEEEEEEEEEEAEEEEEEEEEEEEEEEEEEEEAEAEEEEEEEEEEEEAEEEEEEEEA<EEEEEEEEEEEEAEEEEAEEEAAEEEAEEEEAEEEEEAEE6<AAEEAAEA<EEEEEAAEEEE<AEA<<<<<<AEA
+";
+        test(in_seq1, 11);
+        test(in_seq2, 31);
+        test(in_seq3, 31);
     }
 }
