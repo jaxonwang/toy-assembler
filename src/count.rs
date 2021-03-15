@@ -232,12 +232,14 @@ fn adj_one_side_degree(adj: &[u32; 8], is_left: bool) -> usize {
 fn get_canonical(kmer: KMer) -> (KMer, bool) {
     // bool is true if there is a change
     use std::cmp::Ordering::*;
-    let rev_comp = get_reverse_complement(&kmer);
-    match kmer.cmp(&rev_comp) {
-        Less => (rev_comp, true),
-        Greater => (kmer, false),
-        Equal => panic!("KMer is plalindrome"),
+    for i in 0..kmer.len()/2 + 1{
+        match kmer[i].cmp(&get_complement_base(kmer[kmer.len() - 1 - i])) {
+            Less => return (get_reverse_complement(&kmer), true),
+            Greater => return (kmer, false),
+            Equal => continue
+        }
     }
+    panic!("KMer is plalindrome")
 }
 
 struct KMerCounter {
