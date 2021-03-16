@@ -1,9 +1,11 @@
 use fastq::{Parser, Record, RefRecord};
+use std::cell::{RefCell, Ref};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -232,11 +234,11 @@ fn adj_one_side_degree(adj: &[u32; 8], is_left: bool) -> usize {
 fn get_canonical(kmer: KMer) -> (KMer, bool) {
     // bool is true if there is a change
     use std::cmp::Ordering::*;
-    for i in 0..kmer.len()/2 + 1{
+    for i in 0..kmer.len() / 2 + 1 {
         match kmer[i].cmp(&get_complement_base(kmer[kmer.len() - 1 - i])) {
             Less => return (get_reverse_complement(&kmer), true),
             Greater => return (kmer, false),
-            Equal => continue
+            Equal => continue,
         }
     }
     panic!("KMer is plalindrome")
@@ -244,6 +246,7 @@ fn get_canonical(kmer: KMer) -> (KMer, bool) {
 
 struct KMerCounter {
     kmer_len: usize,
+    min_cov: usize,
 }
 
 impl KMerCounter {
@@ -299,7 +302,7 @@ impl KMerCounter {
         true
     }
 
-    pub fn distributed_count(&self, count_table: CountTable, world: &SystemCommunicator) {
+    pub fn distributed_count(&self, count_table: &CountTable, world: &SystemCommunicator) {
         let p = world.size();
 
         let mut new_table: CountTable = HashMap::new();
@@ -352,7 +355,7 @@ impl KMerCounter {
 
     fn dispatcher(
         &self,
-        count_table: CountTable,
+        count_table: &CountTable,
         world: &SystemCommunicator,
         local_table: Arc<Mutex<CountTable>>,
     ) {
@@ -404,9 +407,22 @@ impl KMerCounter {
         }
         info!("dispatch done, mpi send time {}", mpi_time);
     }
+
+    fn kmer_coverage_filter(&self, count_table: &mut CountTable) {
+        let mut low_cov_kmers: Vec<KMer> = vec![];
+        for (k, data) in count_table.iter() {
+            if (data.count as usize) < self.min_cov {
+                low_cov_kmers.push(k.clone());
+            }
+        }
+        for k in low_cov_kmers {
+            count_table.remove(&k);
+        }
+    }
 }
 
 struct LinearPath {
+    // two sides
     path: Vec<u8>,
     coverage: u32,
 }
@@ -423,14 +439,97 @@ fn adj_str(adj: &[u32; 8]) -> String {
     kmer_str(&sj)
 }
 
+struct CompactNode {
+    start_kmer: KMer,
+    end_kmer: KMer,
+    coverage: u32,
+}
+impl CompactNode {
+    fn new(p: &[u8], kmer_len: usize, cov: u32) -> Self{
+        assert!(
+            kmer_len >= p.len(),
+            format!("vec too short: {} need: {}", p.len(), kmer_len)
+        );
+        CompactNode {
+            start_kmer: p[..kmer_len].to_vec(),
+            end_kmer: p[p.len() - kmer_len..p.len()].to_vec(),
+            coverage: cov,
+        }
+    }
+}
+
+struct SubGraph {
+    //CSC format
+    nodes: Vec<CompactNode>, //sorted
+    adjs: Vec<Vec<usize>>,   // adj[0] -> list of index node 0 connect to
+}
+
+impl SubGraph {
+    fn new_single_kmer(k: &KMer, kmer_len:usize, cov: u32) -> Self {
+        SubGraph {
+            nodes: vec![CompactNode::new(&k[..], kmer_len, cov)],
+            adjs: vec![vec![]],
+        }
+    }
+}
+
+enum Connect {
+    SomeGraph(Rc<RefCell<SubGraph>>),
+    SomeLinear(Rc<RefCell<LinearPath>>),
+}
+
+impl Clone for Connect{
+    fn clone(&self) -> Self{
+        match self{
+            Connect::SomeGraph(a) => Connect::SomeGraph(a.clone()),
+            Connect::SomeLinear(a) => Connect::SomeLinear(a.clone()),
+        }
+    }
+}
+
+impl Connect {
+    fn new_some_graph(g: SubGraph) -> Self {
+        Self::SomeGraph(Rc::new(RefCell::new(g)))
+    }
+    fn new_some_linear(l: LinearPath) -> Self {
+        Self::SomeLinear(Rc::new(RefCell::new(l)))
+    }
+    #[allow(dead_code)]
+    fn unwrap_graph(self) -> Rc<RefCell<SubGraph>>{
+        match self{
+            Self::SomeGraph(g) => g,
+            _ => panic!("Connect cannot be graph")
+        }
+    }
+    #[allow(dead_code)]
+    fn unwrap_linear(self) -> Rc<RefCell<LinearPath>>{
+        match self{
+            Self::SomeLinear(l) => l,
+            _ => panic!("Connect cannot be linear")
+        }
+    }
+    fn borrow_linear(&self) -> Ref<LinearPath>{
+        match self{
+            Self::SomeLinear(l) => l.borrow(),
+            _ => panic!("Connect cannot be linear")
+        }
+    }
+}
+
+struct KMerExtendData {
+    kmer_data: KMerData,
+    connect: Connect,
+}
+
+type KMerExtendTable = HashMap<KMer, KMerExtendData>;
 // type KMerTable = HashMap<KMer, KMerDataExtend>;
 
-fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> Vec<LinearPath> {
+fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExtendTable {
     let mut visited = HashSet::new();
-    let mut linear_paths: Vec<LinearPath> = vec![];
+    let mut extend_table = HashMap::new();
 
     // try connect kmers
-    for k in kmers_from_counter.keys() {
+    for (k, v) in kmers_from_counter.iter() {
         // extend right
         let is_linear = |x| {
             adj_one_side_degree(&kmers_from_counter[x].adj, false)
@@ -480,7 +579,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> Vec<Lin
                 if kmers_from_counter.contains_key(extend) {
                     // is local
                     current = kmers_from_counter.get_key_value(extend).unwrap().0;
-                } 
+                }
             }
             if !is_left {
                 visited.remove(k); // remove for left travel enabled
@@ -492,7 +591,16 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> Vec<Lin
         let lpath = travel(true); //extend left
 
         if lpath.len() == 0 {
-            continue; // nothing to do for this kmer
+            // nothing to do for this kmer, store it as SubGraph
+            let sub = SubGraph::new_single_kmer(k, kmer_len, v.count);
+            extend_table.insert(
+                k.clone(),
+                KMerExtendData {
+                    kmer_data: v.clone(),
+                    connect: Connect::new_some_graph(sub),
+                },
+            );
+            continue;
         }
 
         let mut path: Vec<u8> = vec![0; lpath.len() + rpath.len() - 2 + k.len()];
@@ -516,9 +624,29 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> Vec<Lin
         }
         path = get_canonical(path).0;
 
-        linear_paths.push(LinearPath { path, coverage });
+        let left_end_kmer = get_canonical(path[..kmer_len].to_vec()).0;
+        let right_end_kmer = get_canonical(path[path.len() - kmer_len..path.len()].to_vec()).0;
+        let cnc = Connect::new_some_linear(LinearPath { path, coverage });
+        let l_kmer_data = kmers_from_counter[&left_end_kmer].clone();
+        let r_kmer_data = kmers_from_counter[&right_end_kmer].clone();
+        extend_table.insert(
+            // insert look up for left
+            left_end_kmer,
+            KMerExtendData {
+                kmer_data: l_kmer_data,
+                connect: cnc.clone(),
+            },
+        );
+        extend_table.insert(
+            // for right
+            right_end_kmer,
+            KMerExtendData {
+                kmer_data: r_kmer_data,
+                connect: cnc.clone(),
+            },
+        );
     }
-    linear_paths
+    extend_table
 }
 
 // pub fn main() {
@@ -569,7 +697,10 @@ fn main() {
     let process_id = Arc::new(format!("P{}", world.rank()));
     setup_logger(process_id).unwrap();
 
-    let counter = KMerCounter { kmer_len: 31 };
+    let counter = KMerCounter {
+        kmer_len: 31,
+        min_cov: 1,
+    };
     //     let in1 = "@
     // AAATTTCC
     // +
@@ -590,7 +721,9 @@ fn main() {
 
     let mut count_table = HashMap::new();
     counter.count_kmers_from_fastq(&mut count_table, f).unwrap();
-    counter.distributed_count(count_table, &world);
+    counter.distributed_count(&count_table, &world);
+    counter.kmer_coverage_filter(&mut count_table);
+    local_linear_path(count_table, counter.kmer_len);
 }
 
 #[cfg(test)]
@@ -610,7 +743,19 @@ AAATTGCC
 AAAAAEEE
 ";
 
-        let counter = KMerCounter { kmer_len: 6 };
+        let map_kmer = |x: &(&str, u32, [u32; 8])| {
+            (
+                new_kmer(x.0),
+                KMerData {
+                    count: x.1,
+                    adj: x.2,
+                },
+            )
+        };
+        let counter = KMerCounter {
+            kmer_len: 6,
+            min_cov: 1,
+        };
         let mut count_table = HashMap::new();
         counter
             .count_kmers_from_fastq(&mut count_table, in1.as_bytes())
@@ -622,20 +767,15 @@ AAAAAEEE
         ]
         // number of edges adjcent to a kmer with base [leftA, leftT, leftG, leftC, rightG, rC, rA, rT];
         .iter()
-        .map(|x| {
-            (
-                new_kmer(x.0),
-                KMerData {
-                    count: x.1,
-                    adj: x.2,
-                },
-            )
-        })
+        .map(map_kmer)
         .collect();
         assert_eq!(count_table, out1);
 
         let mut count_table = HashMap::new();
-        let counter = KMerCounter { kmer_len: 3 };
+        let counter = KMerCounter {
+            kmer_len: 3,
+            min_cov: 1,
+        };
         counter
             .count_kmers_from_fastq(&mut count_table, in1.as_bytes())
             .unwrap();
@@ -648,16 +788,24 @@ AAAAAEEE
             ("TTT", 1, [1, 0, 0, 0, 0, 0, 0, 0]),
         ]
         .iter()
-        .map(|x| {
-            (
-                new_kmer(x.0),
-                KMerData {
-                    count: x.1,
-                    adj: x.2,
-                },
-            )
-        })
+        .map(map_kmer)
         .collect();
+        assert_eq!(count_table, out1);
+
+        let mut count_table = HashMap::new(); // test kmer cov filter
+        let counter = KMerCounter {
+            kmer_len: 3,
+            min_cov: 2,
+        };
+        counter
+            .count_kmers_from_fastq(&mut count_table, in1.as_bytes())
+            .unwrap();
+        counter.kmer_coverage_filter(&mut count_table);
+
+        let out1: CountTable = [("ATT", 2, [2, 0, 0, 0, 1, 0, 0, 1])]
+            .iter()
+            .map(map_kmer)
+            .collect();
         assert_eq!(count_table, out1);
 
         // for (key, v) in count_table.iter() {
@@ -777,7 +925,10 @@ AAAAAEEE
     #[test]
     fn local_linear_path_test() {
         let test = |in_seq: &str, kmer_len| {
-            let counter = KMerCounter { kmer_len };
+            let counter = KMerCounter {
+                kmer_len,
+                min_cov: 1,
+            };
             let mut count_table: CountTable = HashMap::new();
             counter
                 .count_kmers_from_fastq(&mut count_table, in_seq.as_bytes())
@@ -785,11 +936,15 @@ AAAAAEEE
             for (_, v) in count_table.iter() {
                 assert_eq!(v.count, 1);
             }
-            let paths = local_linear_path(count_table, counter.kmer_len);
+            let table = local_linear_path(count_table, counter.kmer_len);
             let seq = get_canonical(in_seq.split('\n').nth(1).unwrap().as_bytes().to_vec()).0;
-            assert_eq!(paths.len(), 1);
-            assert_eq!(paths[0].path, seq);
-            assert_eq!(paths[0].coverage as usize, seq.len() - counter.kmer_len + 1);
+            let left_most_kmer = get_canonical(seq[..counter.kmer_len].to_vec()).0;
+            let right_most_kmer = get_canonical(seq[seq.len() - counter.kmer_len..seq.len()].to_vec()).0;
+            let linear_path = table[&left_most_kmer].connect.borrow_linear();
+            let linear_path_r = table[&right_most_kmer].connect.borrow_linear();
+            assert_eq!(linear_path.path, linear_path_r.path);
+            assert_eq!(linear_path.path, seq);
+            assert_eq!(linear_path.coverage as usize, seq.len() - counter.kmer_len + 1);
         };
         let in_seq1 = "@
 ATTAAACACGGTCAGATTCG
