@@ -1,7 +1,7 @@
 use fastq::{Parser, Record, RefRecord};
-use std::cell::{RefCell, Ref};
+use serde::{Deserialize, Serialize};
+use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io;
@@ -15,11 +15,15 @@ extern crate fastq;
 extern crate fern;
 extern crate log;
 extern crate mpi;
+extern crate serde;
 
 use log::{debug, info};
 use mpi::topology::SystemCommunicator;
 use mpi::traits::*;
 use mpi::Threading;
+
+mod msg;
+use self::msg::Packed;
 
 type CountNumber = u32;
 type KMer = Vec<u8>;
@@ -28,7 +32,7 @@ fn kmer_str(k: &KMer) -> String {
     String::from_utf8_lossy(&k[..]).to_string()
 }
 
-#[derive(Debug, Copy, Clone, Eq)]
+#[derive(Debug, Copy, Clone, Eq, Serialize, Deserialize)]
 struct KMerData {
     adj: [u32; 8], // number of edges adjcent to a kmer with base [leftA, leftT, leftG, leftC, rightG, rC, rA, rT];
     count: CountNumber,
@@ -46,6 +50,7 @@ const BASE_T: u8 = b'T';
 const BASE_C: u8 = b'C';
 const BASE_G: u8 = b'G';
 
+#[allow(dead_code)]
 fn partition_by_borders<O: Ord>(kmer: &O, borders: &[O]) -> usize {
     // return i if kmer lies in (borders[i-1], borders[i]]
     use std::cmp::Ordering::*;
@@ -91,30 +96,6 @@ fn partition_by_hash(kmer: &KMer, partition_num: usize) -> usize {
 mod mpiconst {
     pub const ROOT_RANK: mpi::topology::Rank = 0;
     pub const DONE_MARK: &[u8] = "Done".as_bytes();
-}
-
-const KMER_DATA_SIZE: usize = std::mem::size_of::<KMerData>();
-type KDBytes = [u8; KMER_DATA_SIZE];
-union KD {
-    kmer_data: KMerData,
-    bytes: KDBytes,
-}
-
-fn pack(buf: &mut [u8], kmer: &KMer, kmer_data: &KMerData) -> usize {
-    buf[..kmer.len()].copy_from_slice(&kmer[..]);
-    let kc = KD {
-        kmer_data: *kmer_data,
-    };
-    buf[kmer.len()..kmer.len() + KMER_DATA_SIZE].copy_from_slice(&unsafe { kc.bytes }[..]);
-    KMER_DATA_SIZE + kmer.len()
-}
-
-fn unpack(buf: &[u8]) -> (KMer, KMerData) {
-    let kmer = buf[..buf.len() - KMER_DATA_SIZE].to_vec();
-    let bytes: [u8; KMER_DATA_SIZE] =
-        <[u8; KMER_DATA_SIZE]>::try_from(&buf[buf.len() - KMER_DATA_SIZE..]).unwrap();
-    let kc = KD { bytes };
-    (kmer, unsafe { kc.kmer_data })
 }
 
 fn update_count_table(count_table: &mut CountTable, kmer: KMer, kmerdata: KMerData) {
@@ -327,13 +308,19 @@ impl KMerCounter {
                     debug!("{} Done!", s.source_rank());
                     continue;
                 }
-                let item_size = self.kmer_len + KMER_DATA_SIZE;
                 let mut pos = 0usize;
                 // unpack the msg one by one
-                while pos < msg.len() {
-                    let (kmer, kmerdata) = unpack(&msg[pos..pos + item_size]);
+                loop {
+                    let (ret, size) = KMer::unpack(&msg[pos..]);
+                    let kmer = match ret {
+                        Ok(k) => k,
+                        Err(_) => break,
+                    };
+                    pos += size;
+                    let (ret, size) = KMerData::unpack(&msg[pos..]);
+                    let kmerdata = ret.unwrap();
+                    pos += size;
                     update_count_table(&mut new_table, kmer, kmerdata);
-                    pos += item_size;
                 }
             }
         })
@@ -360,13 +347,13 @@ impl KMerCounter {
         local_table: Arc<Mutex<CountTable>>,
     ) {
         let myrank = world.rank();
-        let buffer_size = 100;
-        let item_size = self.kmer_len + KMER_DATA_SIZE;
-        let item_num = buffer_size / item_size;
+        let buffer_size = 128usize;
+        let max_num_in_buf = 1usize;
+        let mut num_in_buf = 0usize;
         let mut mpi_time = 0f64;
-        let mut buffers: Vec<(Vec<u8>, usize)> = vec![];
+        let mut buffers: Vec<Vec<u8>> = vec![];
         for _ in 0..world.size() {
-            buffers.push((vec![0u8; item_size * item_num], 0usize));
+            buffers.push(Vec::<u8>::with_capacity(buffer_size));
         }
 
         for (k, v) in count_table.iter() {
@@ -377,16 +364,17 @@ impl KMerCounter {
                 update_count_table(&mut *guard, k.clone(), *v);
                 continue;
             }
-            let pos = buffers[dst].1;
-            if pos == buffers[dst].0.len() {
+            if num_in_buf == max_num_in_buf {
                 let dst_process = world.process_at_rank(dst as mpi::topology::Rank);
                 let start = Instant::now();
-                dst_process.send(&buffers[dst].0[..]); // send full buf
+                dst_process.send(&buffers[dst][..]); // send full buf
                 mpi_time += (Instant::now() - start).as_secs_f64();
                 // empty buffer
+                buffers[dst].truncate(0);
             } else {
-                pack(&mut buffers[dst].0[pos..pos + item_size], k, v);
-                buffers[dst].1 += item_size;
+                k.pack(&mut buffers[dst]);
+                v.pack(&mut buffers[dst]);
+                num_in_buf += 1;
             }
 
             // debug!(
@@ -398,9 +386,7 @@ impl KMerCounter {
         for dst in 0..world.size() {
             if dst != myrank {
                 let start = Instant::now();
-                world
-                    .process_at_rank(dst)
-                    .send(&buffers[dst as usize].0[0..buffers[dst as usize].1]);
+                world.process_at_rank(dst).send(&buffers[dst as usize][..]);
                 world.process_at_rank(dst).send(mpiconst::DONE_MARK);
                 mpi_time += (Instant::now() - start).as_secs_f64();
             }
@@ -439,13 +425,15 @@ fn adj_str(adj: &[u32; 8]) -> String {
     kmer_str(&sj)
 }
 
+#[derive(Serialize, Deserialize)]
 struct CompactNode {
     start_kmer: KMer,
     end_kmer: KMer,
     coverage: u32,
 }
+
 impl CompactNode {
-    fn new(p: &[u8], kmer_len: usize, cov: u32) -> Self{
+    fn new(p: &[u8], kmer_len: usize, cov: u32) -> Self {
         assert!(
             kmer_len >= p.len(),
             format!("vec too short: {} need: {}", p.len(), kmer_len)
@@ -458,6 +446,7 @@ impl CompactNode {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct SubGraph {
     //CSC format
     nodes: Vec<CompactNode>, //sorted
@@ -465,7 +454,7 @@ struct SubGraph {
 }
 
 impl SubGraph {
-    fn new_single_kmer(k: &KMer, kmer_len:usize, cov: u32) -> Self {
+    fn new_single_kmer(k: &KMer, kmer_len: usize, cov: u32) -> Self {
         SubGraph {
             nodes: vec![CompactNode::new(&k[..], kmer_len, cov)],
             adjs: vec![vec![]],
@@ -478,9 +467,9 @@ enum Connect {
     SomeLinear(Rc<RefCell<LinearPath>>),
 }
 
-impl Clone for Connect{
-    fn clone(&self) -> Self{
-        match self{
+impl Clone for Connect {
+    fn clone(&self) -> Self {
+        match self {
             Connect::SomeGraph(a) => Connect::SomeGraph(a.clone()),
             Connect::SomeLinear(a) => Connect::SomeLinear(a.clone()),
         }
@@ -495,23 +484,23 @@ impl Connect {
         Self::SomeLinear(Rc::new(RefCell::new(l)))
     }
     #[allow(dead_code)]
-    fn unwrap_graph(self) -> Rc<RefCell<SubGraph>>{
-        match self{
+    fn unwrap_graph(self) -> Rc<RefCell<SubGraph>> {
+        match self {
             Self::SomeGraph(g) => g,
-            _ => panic!("Connect cannot be graph")
+            _ => panic!("Connect cannot be graph"),
         }
     }
     #[allow(dead_code)]
-    fn unwrap_linear(self) -> Rc<RefCell<LinearPath>>{
-        match self{
+    fn unwrap_linear(self) -> Rc<RefCell<LinearPath>> {
+        match self {
             Self::SomeLinear(l) => l,
-            _ => panic!("Connect cannot be linear")
+            _ => panic!("Connect cannot be linear"),
         }
     }
-    fn borrow_linear(&self) -> Ref<LinearPath>{
-        match self{
+    fn borrow_linear(&self) -> Ref<LinearPath> {
+        match self {
             Self::SomeLinear(l) => l.borrow(),
-            _ => panic!("Connect cannot be linear")
+            _ => panic!("Connect cannot be linear"),
         }
     }
 }
@@ -522,7 +511,6 @@ struct KMerExtendData {
 }
 
 type KMerExtendTable = HashMap<KMer, KMerExtendData>;
-// type KMerTable = HashMap<KMer, KMerDataExtend>;
 
 fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExtendTable {
     let mut visited = HashSet::new();
@@ -880,20 +868,6 @@ AAAAAEEE
     }
 
     #[test]
-    fn packing_test() {
-        let kmer: KMer = "ABCDE".as_bytes().to_vec();
-        let data = KMerData {
-            count: 1,
-            adj: [1, 2, 3, 4, 5, 6, 7, 8],
-        };
-        let mut buf = vec![0u8; kmer.len() + KMER_DATA_SIZE];
-        pack(&mut buf[..], &kmer, &data);
-        let (kmer1, data1) = unpack(&buf[..]);
-        assert_eq!(data, data1);
-        assert_eq!(kmer1, kmer);
-    }
-
-    #[test]
     fn get_reverse_complement_test() {
         let k = new_kmer("ATGC");
         assert_eq!(new_kmer("GCAT"), get_reverse_complement(&k));
@@ -939,12 +913,16 @@ AAAAAEEE
             let table = local_linear_path(count_table, counter.kmer_len);
             let seq = get_canonical(in_seq.split('\n').nth(1).unwrap().as_bytes().to_vec()).0;
             let left_most_kmer = get_canonical(seq[..counter.kmer_len].to_vec()).0;
-            let right_most_kmer = get_canonical(seq[seq.len() - counter.kmer_len..seq.len()].to_vec()).0;
+            let right_most_kmer =
+                get_canonical(seq[seq.len() - counter.kmer_len..seq.len()].to_vec()).0;
             let linear_path = table[&left_most_kmer].connect.borrow_linear();
             let linear_path_r = table[&right_most_kmer].connect.borrow_linear();
             assert_eq!(linear_path.path, linear_path_r.path);
             assert_eq!(linear_path.path, seq);
-            assert_eq!(linear_path.coverage as usize, seq.len() - counter.kmer_len + 1);
+            assert_eq!(
+                linear_path.coverage as usize,
+                seq.len() - counter.kmer_len + 1
+            );
         };
         let in_seq1 = "@
 ATTAAACACGGTCAGATTCG
