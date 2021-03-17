@@ -178,13 +178,13 @@ fn adj_new_edge_with_base(adj: &mut [u32; 8], is_left: bool, base: u8) {
     adj[adj_position(is_left, base)] += 1;
 }
 
-fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, is_left: bool) -> Vec<KMer> {
+fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, is_left: bool) -> Vec<(KMer, u8)> {
     // return the out edge bases
     let range = match is_left {
         true => 0..4,
         false => 4..8,
     };
-    let mut neighbors: Vec<KMer> = vec![];
+    let mut neighbors: Vec<(KMer, u8)> = vec![];
     for i in range {
         if data.adj[i] > 0 {
             let mut neighbor_kmer: KMer = vec![0u8; kmer.len()];
@@ -195,10 +195,53 @@ fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, is_left: bool) -> Vec<KMer> 
                 neighbor_kmer[..kmer.len() - 1].copy_from_slice(&kmer[1..]);
                 neighbor_kmer[kmer.len() - 1] = adj_base(i);
             }
-            neighbors.push(neighbor_kmer);
+            neighbors.push((neighbor_kmer, adj_base(i)));
         }
     }
     neighbors
+}
+
+trait KMerIndexing<'a, V>: std::ops::Index<&'a KMer, Output = V> {
+    fn get_adj_mut(&mut self, kmer: &KMer) -> Option<&mut [u32; 8]>;
+}
+
+impl KMerIndexing<'_, KMerData> for CountTable {
+    fn get_adj_mut(&mut self, kmer: &KMer) -> Option<&mut [u32; 8]> {
+        self.get_mut(kmer).map(|x| &mut x.adj)
+    }
+}
+impl KMerIndexing<'_, KMerExtendData> for KMerExtendTable {
+    fn get_adj_mut(&mut self, kmer: &KMer) -> Option<&mut [u32; 8]> {
+        self.get_mut(kmer).map(|x| &mut x.kmer_data.adj)
+    }
+}
+
+fn remove_edges_connect_to_kmer<'a, T, V>(
+    table: &mut T,
+    kmer: &KMer,
+    kmer_data: &KMerData,
+    is_left: bool,
+) where
+    T: KMerIndexing<'a, V>,
+{
+    let neighbors = kmer_side_neighbor(kmer, kmer_data, is_left);
+    for (nk, _) in neighbors {
+        // remove neighbors edge
+        let (nk, changed) = get_canonical(nk);
+        let mut edge;
+        if is_left {
+            edge = kmer[kmer.len() - 1]; // edge is at in k's sides
+        } else {
+            edge = kmer[0];
+        }
+        if changed {
+            edge = get_complement_base(edge);
+        }
+        match table.get_adj_mut(&nk) {
+            Some(adj) => adj[adj_position(!is_left ^ changed, edge)] = 0,
+            None => (),
+        }
+    }
 }
 
 fn adj_one_side_degree(adj: &[u32; 8], is_left: bool) -> usize {
@@ -392,13 +435,16 @@ impl KMerCounter {
     }
 
     fn kmer_coverage_filter(&self, count_table: &mut CountTable) {
-        let mut low_cov_kmers: Vec<KMer> = vec![];
+        let mut low_cov_kmers: Vec<(KMer, KMerData)> = vec![];
         for (k, data) in count_table.iter() {
             if (data.count as usize) < self.min_cov {
-                low_cov_kmers.push(k.clone());
+                low_cov_kmers.push((k.clone(), data.clone()));
             }
         }
-        for k in low_cov_kmers {
+        for (k, data) in low_cov_kmers {
+            for is_left in [true, false].iter() {
+                remove_edges_connect_to_kmer(count_table, &k, &data, *is_left);
+            }
             count_table.remove(&k);
         }
     }
@@ -446,8 +492,8 @@ impl CompactNode {
 #[derive(Serialize, Deserialize)]
 struct SubGraph {
     //CSC format
-    nodes: Vec<CompactNode>, //sorted
-    adjs: Vec<Vec<[usize;8]>>,   // adj[0] -> list of index node 0 connect to
+    nodes: Vec<CompactNode>,    //sorted
+    adjs: Vec<Vec<[usize; 8]>>, // adj[0] -> list of index node 0 connect to
 }
 
 impl SubGraph {
@@ -556,7 +602,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
                     1 => (),
                     n => panic!(format!("impossible degree {}", n)),
                 }
-                let neighbor = neighbor.pop().unwrap();
+                let (neighbor, _) = neighbor.pop().unwrap();
                 let (ref extend, changed) = get_canonical(neighbor);
                 if changed {
                     // change to it reverse complement, to go the same direction, need change
@@ -789,7 +835,7 @@ AAAAAEEE
             .unwrap();
         counter.kmer_coverage_filter(&mut count_table);
 
-        let out1: CountTable = [("ATT", 2, [2, 0, 0, 0, 1, 0, 0, 1])]
+        let out1: CountTable = [("ATT", 2, [2, 0, 0, 0, 0, 0, 0, 0])]
             .iter()
             .map(map_kmer)
             .collect();
@@ -890,7 +936,9 @@ AAAAAEEE
             count: 2,
         };
         let l = kmer_side_neighbor(&kmer, &data, true);
+        let l: Vec<KMer> = l.iter().map(|(k, _)| k.clone()).collect();
         let r = kmer_side_neighbor(&kmer, &data, false);
+        let r: Vec<KMer> = r.iter().map(|(k, _)| k.clone()).collect();
         assert_eq!(l, vec![new_kmer("AATCGATC"), new_kmer("GATCGATC")]);
         assert_eq!(r, vec![new_kmer("TCGATCGC"), new_kmer("TCGATCGT")]);
     }
