@@ -470,20 +470,14 @@ fn adj_str(adj: &[u32; 8]) -> String {
 
 #[derive(Serialize, Deserialize)]
 struct CompactNode {
-    start_kmer: KMer,
-    end_kmer: KMer,
+    node: Vec<u8>,
     coverage: u32,
 }
 
 impl CompactNode {
-    fn new(p: &[u8], kmer_len: usize, cov: u32) -> Self {
-        assert!(
-            kmer_len >= p.len(),
-            format!("vec too short: {} need: {}", p.len(), kmer_len)
-        );
+    fn new(p: &[u8], cov: u32) -> Self {
         CompactNode {
-            start_kmer: p[..kmer_len].to_vec(),
-            end_kmer: p[p.len() - kmer_len..p.len()].to_vec(),
+            node: p.to_vec(),
             coverage: cov,
         }
     }
@@ -499,15 +493,28 @@ struct SubGraph {
 impl SubGraph {
     fn new_single_kmer(k: &KMer, kmer_len: usize, cov: u32) -> Self {
         SubGraph {
-            nodes: vec![CompactNode::new(&k[..], kmer_len, cov)],
+            nodes: vec![CompactNode::new(&k[..], cov)],
             adjs: vec![vec![]],
         }
     }
 }
 
+#[derive(Clone)]
+struct GraphConnect {
+    ptr: Rc<RefCell<SubGraph>>,
+    node_idx: usize, // which node connect to?
+    direction: bool, // is_left -> true, which side connect to?
+}
+
+#[derive(Clone)]
+struct LinearConnect {
+    ptr: Rc<RefCell<LinearPath>>,
+    direction: bool,
+}
+
 enum Connect {
-    SomeGraph(Rc<RefCell<SubGraph>>),
-    SomeLinear(Rc<RefCell<LinearPath>>),
+    SomeGraph(GraphConnect),
+    SomeLinear(LinearConnect),
 }
 
 impl Clone for Connect {
@@ -520,29 +527,36 @@ impl Clone for Connect {
 }
 
 impl Connect {
-    fn new_some_graph(g: SubGraph) -> Self {
-        Self::SomeGraph(Rc::new(RefCell::new(g)))
+    fn new_some_graph(ptr: Rc<RefCell<SubGraph>>, node_idx: usize, direction: bool) -> Self {
+        Self::SomeGraph(GraphConnect {
+            ptr,
+            node_idx,
+            direction,
+        })
     }
-    fn new_some_linear(l: LinearPath) -> Self {
-        Self::SomeLinear(Rc::new(RefCell::new(l)))
+    fn new_some_linear(ptr: Rc<RefCell<LinearPath>>, direction: bool) -> Self {
+        Self::SomeLinear(LinearConnect {
+            ptr,
+            direction,
+        })
     }
     #[allow(dead_code)]
     fn unwrap_graph(self) -> Rc<RefCell<SubGraph>> {
         match self {
-            Self::SomeGraph(g) => g,
+            Self::SomeGraph(g) => g.ptr,
             _ => panic!("Connect is not graph"),
         }
     }
     #[allow(dead_code)]
     fn unwrap_linear(self) -> Rc<RefCell<LinearPath>> {
         match self {
-            Self::SomeLinear(l) => l,
+            Self::SomeLinear(l) => l.ptr,
             _ => panic!("Connect is not linear"),
         }
     }
     fn borrow_linear(&self) -> Ref<LinearPath> {
         match self {
-            Self::SomeLinear(l) => l.borrow(),
+            Self::SomeLinear(l) => l.ptr.borrow(),
             _ => panic!("Connect is not linear"),
         }
     }
@@ -624,12 +638,12 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
 
         if lpath.len() == 0 {
             // nothing to do for this kmer, store it as SubGraph
-            let sub = SubGraph::new_single_kmer(k, kmer_len, v.count);
+            let sub = Rc::new(RefCell::new(SubGraph::new_single_kmer(k, kmer_len, v.count)));
             extend_table.insert(
                 k.clone(),
                 KMerExtendData {
                     kmer_data: v.clone(),
-                    connect: Connect::new_some_graph(sub),
+                    connect: Connect::new_some_graph(sub, 0, false),
                 },
             );
             continue;
@@ -658,7 +672,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
 
         let left_end_kmer = get_canonical(path[..kmer_len].to_vec()).0;
         let right_end_kmer = get_canonical(path[path.len() - kmer_len..path.len()].to_vec()).0;
-        let cnc = Connect::new_some_linear(LinearPath { path, coverage });
+        let lp_obj = Rc::new(RefCell::new(LinearPath { path, coverage }));
         let l_kmer_data = kmers_from_counter[&left_end_kmer].clone();
         let r_kmer_data = kmers_from_counter[&right_end_kmer].clone();
         extend_table.insert(
@@ -666,7 +680,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
             left_end_kmer,
             KMerExtendData {
                 kmer_data: l_kmer_data,
-                connect: cnc.clone(),
+                connect: Connect::new_some_linear(lp_obj.clone(), true),
             },
         );
         extend_table.insert(
@@ -674,12 +688,21 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
             right_end_kmer,
             KMerExtendData {
                 kmer_data: r_kmer_data,
-                connect: cnc.clone(),
+                connect: Connect::new_some_linear(lp_obj.clone(), false),
             },
         );
     }
     info!("linear path generation done.");
     extend_table
+}
+
+fn remove_low_coverage_tips(world: &SystemCommunicator, kmer_table: &mut KMerExtendTable) {
+    let tip_path = vec![];
+    for (k, data) in kmer_table.iter() {
+        // 
+        // data.kmer_data
+        //     adj_one_side_degree
+    }
 }
 
 // pub fn main() {
