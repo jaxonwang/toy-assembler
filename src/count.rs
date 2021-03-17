@@ -310,12 +310,9 @@ impl KMerCounter {
                 }
                 let mut pos = 0usize;
                 // unpack the msg one by one
-                loop {
+                while pos != msg.len() {
                     let (ret, size) = KMer::unpack(&msg[pos..]);
-                    let kmer = match ret {
-                        Ok(k) => k,
-                        Err(_) => break,
-                    };
+                    let kmer = ret.unwrap();
                     pos += size;
                     let (ret, size) = KMerData::unpack(&msg[pos..]);
                     let kmerdata = ret.unwrap();
@@ -450,7 +447,7 @@ impl CompactNode {
 struct SubGraph {
     //CSC format
     nodes: Vec<CompactNode>, //sorted
-    adjs: Vec<Vec<usize>>,   // adj[0] -> list of index node 0 connect to
+    adjs: Vec<Vec<[usize;8]>>,   // adj[0] -> list of index node 0 connect to
 }
 
 impl SubGraph {
@@ -487,20 +484,20 @@ impl Connect {
     fn unwrap_graph(self) -> Rc<RefCell<SubGraph>> {
         match self {
             Self::SomeGraph(g) => g,
-            _ => panic!("Connect cannot be graph"),
+            _ => panic!("Connect is not graph"),
         }
     }
     #[allow(dead_code)]
     fn unwrap_linear(self) -> Rc<RefCell<LinearPath>> {
         match self {
             Self::SomeLinear(l) => l,
-            _ => panic!("Connect cannot be linear"),
+            _ => panic!("Connect is not linear"),
         }
     }
     fn borrow_linear(&self) -> Ref<LinearPath> {
         match self {
             Self::SomeLinear(l) => l.borrow(),
-            _ => panic!("Connect cannot be linear"),
+            _ => panic!("Connect is not linear"),
         }
     }
 }
@@ -515,6 +512,7 @@ type KMerExtendTable = HashMap<KMer, KMerExtendData>;
 fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExtendTable {
     let mut visited = HashSet::new();
     let mut extend_table = HashMap::new();
+    info!("start local linear path generation.");
 
     // try connect kmers
     for (k, v) in kmers_from_counter.iter() {
@@ -634,6 +632,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
             },
         );
     }
+    info!("linear path generation done.");
     extend_table
 }
 

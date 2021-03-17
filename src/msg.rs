@@ -1,12 +1,13 @@
 use std::io::{Error, ErrorKind, Result};
 
 use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
 
 extern crate bincode;
 
-pub trait Packed<'a> {
+pub trait Packed {
     fn pack(&self, buf: &mut Vec<u8>);
-    fn unpack(buf: &'a [u8]) -> (Result<Self>, usize)
+    fn unpack(buf: &[u8]) -> (Result<Self>, usize)
     where
         Self: Sized;
 }
@@ -17,7 +18,7 @@ union UsizeBytes {
     bytes: [u8; USIZE_LEN],
 }
 
-impl<'a, T: Serialize + Deserialize<'a>> Packed<'a> for T {
+impl<T: Serialize + DeserializeOwned> Packed for T {
     fn pack(&self, buf: &mut Vec<u8>) {
         // let type_size:usize = std::mem::size_of::<T>();
         let s = bincode::serialize(&self).unwrap();
@@ -26,15 +27,15 @@ impl<'a, T: Serialize + Deserialize<'a>> Packed<'a> for T {
         buf.extend_from_slice(&unsafe { len.bytes }[..]);
         buf.extend_from_slice(&s[..]);
     }
-    fn unpack(buf: &'a [u8]) -> (Result<T>, usize) {
+    fn unpack(buf: & [u8]) -> (Result<T>, usize) {
         match buf.len() {
-            l if l < USIZE_LEN => panic!("bad msg"),
             0 => (Err(Error::new(ErrorKind::InvalidData, "Reaching End")), 0),
+            l if l < USIZE_LEN => panic!("bad msg"),
             _ => {
                 let mut bytes = [0u8; USIZE_LEN];
                 bytes.copy_from_slice(&buf[..USIZE_LEN]);
                 let len = unsafe { UsizeBytes { bytes }.n };
-                (Ok(bincode::deserialize(&buf[USIZE_LEN..]).unwrap()), len)
+                (Ok(bincode::deserialize(&buf[USIZE_LEN..]).unwrap()), len + USIZE_LEN)
             }
         }
     }
