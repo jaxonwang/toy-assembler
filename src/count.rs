@@ -1,6 +1,6 @@
 use fastq::{Parser, Record, RefRecord};
 use serde::{Deserialize, Serialize};
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -33,11 +33,11 @@ enum Direction {
 
 use self::Direction::*;
 
-impl Direction{
-    fn reverse(&self) ->Direction{
-        match self{
+impl Direction {
+    fn reverse(&self) -> Direction {
+        match self {
             Left => Right,
-            Right => Left
+            Right => Left,
         }
     }
 }
@@ -252,7 +252,7 @@ fn remove_edges_connect_to_kmer<'a, T, V>(
         if changed {
             edge = get_complement_base(edge);
             neightbor_end = direction;
-        }else{
+        } else {
             neightbor_end = direction.reverse();
         }
         match table.get_adj_mut(&nk) {
@@ -263,12 +263,18 @@ fn remove_edges_connect_to_kmer<'a, T, V>(
 }
 
 fn adj_one_side_degree(adj: &[u32; 8], direction: Direction) -> usize {
-    let range = match direction{
+    let range = match direction {
         Left => 0..4,
         Right => 4..8,
     };
     adj[range]
         .iter()
+        .filter_map(|c| if *c > 0 { Some(1) } else { None })
+        .sum()
+}
+
+fn adj_degree(adj: &[u32; 8]) -> usize {
+    adj.iter()
         .filter_map(|c| if *c > 0 { Some(1) } else { None })
         .sum()
 }
@@ -525,7 +531,7 @@ struct SubGraph {
 }
 
 impl SubGraph {
-    fn new_single_kmer(k: &KMer, kmer_len: usize, cov: u32) -> Self {
+    fn new_single_kmer(k: &KMer, cov: u32) -> Self {
         SubGraph {
             nodes: vec![CompactNode::new(&k[..], cov)],
             adjs: vec![vec![]],
@@ -536,7 +542,7 @@ impl SubGraph {
 #[derive(Clone)]
 struct GraphConnect {
     ptr: Rc<RefCell<SubGraph>>,
-    node_idx: usize, // which node connect to?
+    node_idx: usize,      // which node connect to?
     direction: Direction, // is_left -> true, which side connect to?
 }
 
@@ -608,16 +614,12 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
     // try connect kmers
     for (k, v) in kmers_from_counter.iter() {
         // extend right
-        let is_linear = |x| {
-            adj_one_side_degree(&kmers_from_counter[x].adj, Right)
-                + adj_one_side_degree(&kmers_from_counter[x].adj, Left)
-                <= 2
-        };
+        let is_linear = |x| adj_degree(&kmers_from_counter[x].adj) <= 2;
         if visited.contains(k) {
             continue;
         }
 
-        let mut travel = |is_left:Direction| -> Vec<(u8, u32)> {
+        let mut travel = |is_left: Direction| -> Vec<(u8, u32)> {
             let mut side_path: Vec<(u8, u32)> = vec![]; // base, count
             let mut current: &KMer = k;
             let mut direction = is_left;
@@ -669,9 +671,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
 
         if lpath.len() == 0 {
             // nothing to do for this kmer, store it as SubGraph
-            let sub = Rc::new(RefCell::new(SubGraph::new_single_kmer(
-                k, kmer_len, v.count,
-            )));
+            let sub = Rc::new(RefCell::new(SubGraph::new_single_kmer(k, v.count)));
             extend_table.insert(
                 k.clone(),
                 KMerExtendData {
@@ -731,41 +731,147 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
 
 struct ContigGenerator {
     kmer_len: usize,
+    world: SystemCommunicator,
+    tip_minimal_coverage: f64,
+    tip_minimal_length: usize,
+    tip_travel_stop_length: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+enum TipRemovalMessageType {
+    PathExtension,
+    UnWinding,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TipRemovalCallingFrame {
+    callers: Vec<mpi::topology::Rank>,
+    from_base: u8, // if 0 means it is the start of travel, that's a local request
+    kmer: KMer,    // the kmer to visit next
+    path_len: usize,
+    path_coverage: u32, // count for the path, not count/len
+}
+
+#[derive(Serialize, Deserialize)]
+struct TipRemovalReturn {
+    callers: Vec<mpi::topology::Rank>, // who to returen
+    kmer: KMer,                        // this
+    legal: bool,
 }
 
 impl ContigGenerator {
-    fn travel_kmer(
-        &self,
-        kmer: &KMer,
-        kmer_table: Arc<KMerExtendTable>,
-        world: &SystemCommunicator,
-    ) {
-        let linear_connect = kmer_table[kmer].connect.borrow_linear();
-        // linear_connect.direction
+    fn is_legal_tip(&self, path_len: usize, path_coverage: u32) -> bool {
+        // only judged at the end of a kmer
+        path_len >= self.tip_minimal_length
+            && (path_coverage as f64 / path_len as f64) >= self.tip_minimal_coverage
     }
-}
 
-fn remove_low_coverage_tips(world: &SystemCommunicator, kmer_table: KMerExtendTable) {
-    // must be call after all local linear path are generated
-    let kmer_table = Arc::new(kmer_table);
+    fn tips_travel_kmer(&self, kmer_table: Arc<KMerExtendTable>, frame: TipRemovalCallingFrame) {
+        assert!(
+            kmer_table.contains_key(&frame.kmer),
+            "You asked the wrong peer!"
+        );
+        let ref extended_data = kmer_table[&frame.kmer];
 
-    let mut tip_path: Vec<(&KMer, Direction)> = vec![];
-    for (k, data) in kmer_table.iter() {
-        let degree_left = adj_one_side_degree(&data.kmer_data.adj, Left);
-        let degree_right = adj_one_side_degree(&data.kmer_data.adj, Right);
-        let direction = match (degree_left, degree_right) {
-            (0, 0) => panic!("imposible kmer without degree"),
-            (0, _) => Right,
-            (_, 0) => Left,
-            _ => continue, // not a tips
+        let assemble_ret = |this_path_len, this_path_count| -> TipRemovalReturn {
+            let mut ret_kmer = vec![frame.from_base];
+            ret_kmer.extend_from_slice(&frame.kmer[..self.kmer_len - 1]);
+            let mut callers = frame.callers.clone();
+            let return_to = callers.pop(); // remove one caller
+            TipRemovalReturn {
+                callers,
+                kmer: ret_kmer,
+                legal: self.is_legal_tip(
+                    frame.path_len + this_path_len,
+                    frame.path_coverage + this_path_count,
+                ),
+            }
         };
-        tip_path.push((k, direction));
+
+        if adj_degree(&extended_data.kmer_data.adj) != 2 {
+            // reach end
+            assert!(frame.from_base != 0, "the from base can not be 0! should not get a local request when this kmer is not linear!!");
+            // TODO: send msg back
+            let ret = assemble_ret(0, 0);
+            return;
+        }
+
+        let linear_connect = extended_data.connect.borrow_linear();
+        let linear_path = linear_connect.ptr.borrow();
+        let linear_path_len = linear_path.path.len();
+        if linear_path_len + frame.path_len >= self.tip_travel_stop_length {
+            // if is long engouh, stop traveling, return here to reduce one cross node travel
+            if frame.from_base != 0 {
+                // is from remove, assemble a message
+                let ret = assemble_ret(linear_path_len, linear_path.coverage);
+            } else {
+                let legal = self.is_legal_tip(linear_path_len, linear_path.coverage);
+                // TODO: return legal to local
+            }
+        }
+
+        let other_end_kmer = linear_path.get_ended_kmer(linear_connect.direction, self.kmer_len);
+        let ref other_end_kmer_data = kmer_table[&other_end_kmer].kmer_data;
+
+        let neighbors = kmer_side_neighbor(
+            &other_end_kmer,
+            other_end_kmer_data,
+            linear_connect.direction,
+        );
+        assert!(neighbors.len() == 1, "out edge is not 1");
+        let (next_kmer, changed) = get_canonical(neighbors[0].0.clone());
+        let mut callers = frame.callers.clone();
+        callers.push(self.world.rank());
+        let mut from_base = match linear_connect.direction {
+            Left => other_end_kmer[self.kmer_len - 1],
+            Right => other_end_kmer[0],
+        };
+        if changed {
+            from_base = get_complement_base(from_base);
+        }
+        let call_frame = TipRemovalCallingFrame {
+            callers,
+            from_base,
+            kmer: next_kmer,
+            path_len: linear_path_len + frame.path_len,
+            path_coverage: linear_path.coverage + frame.path_coverage,
+        };
+        // TODO: send call
     }
-    let low_quality_tips: Vec<Vec<KMer>> = vec![];
 
-    for (k, direction) in tip_path {}
+    fn remove_low_coverage_tips(&self, kmer_table: KMerExtendTable) {
+        // must be call after all local linear path are generated
+        let kmer_table = Arc::new(kmer_table);
+
+        let mut tip_path: Vec<(&KMer, Direction)> = vec![];
+        for (k, data) in kmer_table.iter() {
+            let degree_left = adj_one_side_degree(&data.kmer_data.adj, Left);
+            let degree_right = adj_one_side_degree(&data.kmer_data.adj, Right);
+            let direction = match (degree_left, degree_right) {
+                (0, 0) => panic!("imposible kmer without degree"),
+                (0, 1) => Right,
+                (1, 0) => Left,
+                _ => continue, // not a tip
+            };
+            tip_path.push((k, direction));
+        }
+        let low_quality_tips: Vec<Vec<KMer>> = vec![];
+
+        for (k, direction) in tip_path {
+            // NOTE: this can be paralleled
+            self.tips_travel_kmer(
+                kmer_table.clone(),
+                TipRemovalCallingFrame {
+                    callers: vec![],
+                    from_base: 0,
+                    kmer: k.clone(),
+                    path_len: 0,
+                    path_coverage: 0,
+                },
+            );
+        }
+    }
 }
-
 // pub fn main() {
 //     let kmer_len = 30usize;
 //
@@ -1007,6 +1113,7 @@ AAAAAEEE
         let adj = [4u32, 0, 0, 0, 0, 3, 0, 6];
         assert_eq!(adj_one_side_degree(&adj, Left), 1);
         assert_eq!(adj_one_side_degree(&adj, Right), 2);
+        assert_eq!(adj_degree(&adj), 3);
         let adj = [0u32, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(adj_one_side_degree(&adj, Left), 0);
         assert_eq!(adj_one_side_degree(&adj, Right), 0);
@@ -1074,5 +1181,14 @@ AAAAAEEEEEEEEEEEEEEEEEEEEEEAEEEEEEEEEEEEEEEEEEEEAEAEEEEEEEEEEEEAEEEEEEEEA<EEEEEE
         test(in_seq1, 11);
         test(in_seq2, 31);
         test(in_seq3, 31);
+    }
+    #[test]
+    fn get_ended_kmer_test() {
+        let path = LinearPath {
+            path: "ABCDEFGHIJKLMN".as_bytes().to_vec(),
+            coverage: 1,
+        };
+        assert_eq!(kmer_str(&path.get_ended_kmer(Left, 5)), "ABCDE");
+        assert_eq!(kmer_str(&path.get_ended_kmer(Right, 5)), "JKLMN");
     }
 }
