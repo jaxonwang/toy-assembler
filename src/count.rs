@@ -25,6 +25,23 @@ use mpi::Threading;
 mod msg;
 use self::msg::Packed;
 
+#[derive(Eq, PartialEq, Clone, Copy)]
+enum Direction {
+    Left,
+    Right,
+}
+
+use self::Direction::*;
+
+impl Direction{
+    fn reverse(&self) ->Direction{
+        match self{
+            Left => Right,
+            Right => Left
+        }
+    }
+}
+
 type CountNumber = u32;
 type KMer = Vec<u8>;
 
@@ -140,23 +157,22 @@ fn get_reverse_complement_adj(adj: &[u32; 8]) -> [u32; 8] {
     a
 }
 
-fn adj_position(is_left: bool, base: u8) -> usize {
-    if is_left {
-        match base {
+fn adj_position(direction: Direction, base: u8) -> usize {
+    match direction {
+        Left => match base {
             BASE_A => 0,
             BASE_T => 1,
             BASE_G => 2,
             BASE_C => 3,
             _ => panic!("bad base"),
-        }
-    } else {
-        match base {
+        },
+        Right => match base {
             BASE_G => 4,
             BASE_C => 5,
             BASE_A => 6,
             BASE_T => 7,
             _ => panic!("bad base"),
-        }
+        },
     }
 }
 
@@ -174,21 +190,21 @@ fn adj_base(pos: usize) -> u8 {
     }
 }
 
-fn adj_new_edge_with_base(adj: &mut [u32; 8], is_left: bool, base: u8) {
-    adj[adj_position(is_left, base)] += 1;
+fn adj_new_edge_with_base(adj: &mut [u32; 8], direction: Direction, base: u8) {
+    adj[adj_position(direction, base)] += 1;
 }
 
-fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, is_left: bool) -> Vec<(KMer, u8)> {
+fn kmer_side_neighbor(kmer: &KMer, data: &KMerData, direction: Direction) -> Vec<(KMer, u8)> {
     // return the out edge bases
-    let range = match is_left {
-        true => 0..4,
-        false => 4..8,
+    let range = match direction {
+        Left => 0..4,
+        Right => 4..8,
     };
     let mut neighbors: Vec<(KMer, u8)> = vec![];
     for i in range {
         if data.adj[i] > 0 {
             let mut neighbor_kmer: KMer = vec![0u8; kmer.len()];
-            if is_left {
+            if let Left = direction {
                 neighbor_kmer[1..].copy_from_slice(&kmer[..kmer.len() - 1]);
                 neighbor_kmer[0] = adj_base(i);
             } else {
@@ -220,34 +236,36 @@ fn remove_edges_connect_to_kmer<'a, T, V>(
     table: &mut T,
     kmer: &KMer,
     kmer_data: &KMerData,
-    is_left: bool,
+    direction: Direction,
 ) where
     T: KMerIndexing<'a, V>,
 {
-    let neighbors = kmer_side_neighbor(kmer, kmer_data, is_left);
+    let neighbors = kmer_side_neighbor(kmer, kmer_data, direction);
     for (nk, _) in neighbors {
-        // remove neighbors edge
+        // remove neighbors edges
+        let mut edge = match direction {
+            Left => kmer[kmer.len() - 1], // edge is at in k's sides
+            Right => kmer[0],
+        };
         let (nk, changed) = get_canonical(nk);
-        let mut edge;
-        if is_left {
-            edge = kmer[kmer.len() - 1]; // edge is at in k's sides
-        } else {
-            edge = kmer[0];
-        }
+        let neightbor_end;
         if changed {
             edge = get_complement_base(edge);
+            neightbor_end = direction;
+        }else{
+            neightbor_end = direction.reverse();
         }
         match table.get_adj_mut(&nk) {
-            Some(adj) => adj[adj_position(!is_left ^ changed, edge)] = 0,
+            Some(adj) => adj[adj_position(neightbor_end, edge)] = 0,
             None => (),
         }
     }
 }
 
-fn adj_one_side_degree(adj: &[u32; 8], is_left: bool) -> usize {
-    let range = match is_left {
-        true => 0..4,
-        false => 4..8,
+fn adj_one_side_degree(adj: &[u32; 8], direction: Direction) -> usize {
+    let range = match direction{
+        Left => 0..4,
+        Right => 4..8,
     };
     adj[range]
         .iter()
@@ -308,11 +326,11 @@ impl KMerCounter {
             let mut adj = [0u32; 8];
             if start_pos > 0 {
                 // edge to left
-                adj_new_edge_with_base(&mut adj, true, read[start_pos - 1]);
+                adj_new_edge_with_base(&mut adj, Left, read[start_pos - 1]);
             }
             if start_pos + self.kmer_len < read.len() {
                 //edge to right
-                adj_new_edge_with_base(&mut adj, false, read[start_pos + self.kmer_len]);
+                adj_new_edge_with_base(&mut adj, Right, read[start_pos + self.kmer_len]);
             }
 
             let (canonical, changed) = get_canonical(kmer);
@@ -442,8 +460,8 @@ impl KMerCounter {
             }
         }
         for (k, data) in low_cov_kmers {
-            for is_left in [true, false].iter() {
-                remove_edges_connect_to_kmer(count_table, &k, &data, *is_left);
+            for direction in [Left, Right].iter() {
+                remove_edges_connect_to_kmer(count_table, &k, &data, *direction);
             }
             count_table.remove(&k);
         }
@@ -454,6 +472,22 @@ struct LinearPath {
     // two sides
     path: Vec<u8>,
     coverage: u32,
+}
+
+impl LinearPath {
+    fn get_ended_kmer(&self, direction: Direction, kmer_len: usize) -> KMer {
+        let path_len = self.path.len();
+        if path_len < kmer_len {
+            panic!(format!(
+                "path len: {} shorter than kmer len {}",
+                path_len, kmer_len
+            ));
+        }
+        match direction {
+            Left => self.path[..kmer_len].to_vec(),
+            Right => self.path[path_len - kmer_len..path_len].to_vec(),
+        }
+    }
 }
 
 fn adj_str(adj: &[u32; 8]) -> String {
@@ -503,13 +537,13 @@ impl SubGraph {
 struct GraphConnect {
     ptr: Rc<RefCell<SubGraph>>,
     node_idx: usize, // which node connect to?
-    direction: bool, // is_left -> true, which side connect to?
+    direction: Direction, // is_left -> true, which side connect to?
 }
 
 #[derive(Clone)]
 struct LinearConnect {
     ptr: Rc<RefCell<LinearPath>>,
-    direction: bool,
+    direction: Direction,
 }
 
 enum Connect {
@@ -527,18 +561,15 @@ impl Clone for Connect {
 }
 
 impl Connect {
-    fn new_some_graph(ptr: Rc<RefCell<SubGraph>>, node_idx: usize, direction: bool) -> Self {
+    fn new_some_graph(ptr: Rc<RefCell<SubGraph>>, node_idx: usize, direction: Direction) -> Self {
         Self::SomeGraph(GraphConnect {
             ptr,
             node_idx,
             direction,
         })
     }
-    fn new_some_linear(ptr: Rc<RefCell<LinearPath>>, direction: bool) -> Self {
-        Self::SomeLinear(LinearConnect {
-            ptr,
-            direction,
-        })
+    fn new_some_linear(ptr: Rc<RefCell<LinearPath>>, direction: Direction) -> Self {
+        Self::SomeLinear(LinearConnect { ptr, direction })
     }
     #[allow(dead_code)]
     fn unwrap_graph(self) -> Rc<RefCell<SubGraph>> {
@@ -554,9 +585,9 @@ impl Connect {
             _ => panic!("Connect is not linear"),
         }
     }
-    fn borrow_linear(&self) -> Ref<LinearPath> {
+    fn borrow_linear(&self) -> &LinearConnect {
         match self {
-            Self::SomeLinear(l) => l.ptr.borrow(),
+            Self::SomeLinear(ref l) => l,
             _ => panic!("Connect is not linear"),
         }
     }
@@ -578,15 +609,15 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
     for (k, v) in kmers_from_counter.iter() {
         // extend right
         let is_linear = |x| {
-            adj_one_side_degree(&kmers_from_counter[x].adj, false)
-                + adj_one_side_degree(&kmers_from_counter[x].adj, true)
+            adj_one_side_degree(&kmers_from_counter[x].adj, Right)
+                + adj_one_side_degree(&kmers_from_counter[x].adj, Left)
                 <= 2
         };
         if visited.contains(k) {
             continue;
         }
 
-        let mut travel = |is_left| -> Vec<(u8, u32)> {
+        let mut travel = |is_left:Direction| -> Vec<(u8, u32)> {
             let mut side_path: Vec<(u8, u32)> = vec![]; // base, count
             let mut current: &KMer = k;
             let mut direction = is_left;
@@ -594,7 +625,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
             while !visited.contains(current) && is_linear(current) {
                 visited.insert(current.clone()); // now k is linear && not visited. mark as visited.
                 let base;
-                if is_left {
+                if let Left = is_left {
                     if direction == is_left {
                         base = current[0];
                     } else {
@@ -620,30 +651,32 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
                 let (ref extend, changed) = get_canonical(neighbor);
                 if changed {
                     // change to it reverse complement, to go the same direction, need change
-                    direction = !direction;
+                    direction = direction.reverse();
                 }
                 if kmers_from_counter.contains_key(extend) {
                     // is local
                     current = kmers_from_counter.get_key_value(extend).unwrap().0;
                 }
             }
-            if !is_left {
+            if let Right = is_left {
                 visited.remove(k); // remove for left travel enabled
             }
             side_path
         };
 
-        let rpath = travel(false);
-        let lpath = travel(true); //extend left
+        let rpath = travel(Right);
+        let lpath = travel(Left); //extend left
 
         if lpath.len() == 0 {
             // nothing to do for this kmer, store it as SubGraph
-            let sub = Rc::new(RefCell::new(SubGraph::new_single_kmer(k, kmer_len, v.count)));
+            let sub = Rc::new(RefCell::new(SubGraph::new_single_kmer(
+                k, kmer_len, v.count,
+            )));
             extend_table.insert(
                 k.clone(),
                 KMerExtendData {
                     kmer_data: v.clone(),
-                    connect: Connect::new_some_graph(sub, 0, false),
+                    connect: Connect::new_some_graph(sub, 0, Left),
                 },
             );
             continue;
@@ -680,7 +713,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
             left_end_kmer,
             KMerExtendData {
                 kmer_data: l_kmer_data,
-                connect: Connect::new_some_linear(lp_obj.clone(), true),
+                connect: Connect::new_some_linear(lp_obj.clone(), Left),
             },
         );
         extend_table.insert(
@@ -688,7 +721,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
             right_end_kmer,
             KMerExtendData {
                 kmer_data: r_kmer_data,
-                connect: Connect::new_some_linear(lp_obj.clone(), false),
+                connect: Connect::new_some_linear(lp_obj.clone(), Right),
             },
         );
     }
@@ -696,13 +729,41 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
     extend_table
 }
 
-fn remove_low_coverage_tips(world: &SystemCommunicator, kmer_table: &mut KMerExtendTable) {
-    let tip_path = vec![];
-    for (k, data) in kmer_table.iter() {
-        // 
-        // data.kmer_data
-        //     adj_one_side_degree
+struct ContigGenerator {
+    kmer_len: usize,
+}
+
+impl ContigGenerator {
+    fn travel_kmer(
+        &self,
+        kmer: &KMer,
+        kmer_table: Arc<KMerExtendTable>,
+        world: &SystemCommunicator,
+    ) {
+        let linear_connect = kmer_table[kmer].connect.borrow_linear();
+        // linear_connect.direction
     }
+}
+
+fn remove_low_coverage_tips(world: &SystemCommunicator, kmer_table: KMerExtendTable) {
+    // must be call after all local linear path are generated
+    let kmer_table = Arc::new(kmer_table);
+
+    let mut tip_path: Vec<(&KMer, Direction)> = vec![];
+    for (k, data) in kmer_table.iter() {
+        let degree_left = adj_one_side_degree(&data.kmer_data.adj, Left);
+        let degree_right = adj_one_side_degree(&data.kmer_data.adj, Right);
+        let direction = match (degree_left, degree_right) {
+            (0, 0) => panic!("imposible kmer without degree"),
+            (0, _) => Right,
+            (_, 0) => Left,
+            _ => continue, // not a tips
+        };
+        tip_path.push((k, direction));
+    }
+    let low_quality_tips: Vec<Vec<KMer>> = vec![];
+
+    for (k, direction) in tip_path {}
 }
 
 // pub fn main() {
@@ -944,11 +1005,11 @@ AAAAAEEE
     #[test]
     fn adj_one_side_degree_test() {
         let adj = [4u32, 0, 0, 0, 0, 3, 0, 6];
-        assert_eq!(adj_one_side_degree(&adj, true), 1);
-        assert_eq!(adj_one_side_degree(&adj, false), 2);
+        assert_eq!(adj_one_side_degree(&adj, Left), 1);
+        assert_eq!(adj_one_side_degree(&adj, Right), 2);
         let adj = [0u32, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(adj_one_side_degree(&adj, true), 0);
-        assert_eq!(adj_one_side_degree(&adj, false), 0);
+        assert_eq!(adj_one_side_degree(&adj, Left), 0);
+        assert_eq!(adj_one_side_degree(&adj, Right), 0);
     }
 
     #[test]
@@ -958,9 +1019,9 @@ AAAAAEEE
             adj: [1, 0, 1, 0, 0, 1, 0, 1],
             count: 2,
         };
-        let l = kmer_side_neighbor(&kmer, &data, true);
+        let l = kmer_side_neighbor(&kmer, &data, Left);
         let l: Vec<KMer> = l.iter().map(|(k, _)| k.clone()).collect();
-        let r = kmer_side_neighbor(&kmer, &data, false);
+        let r = kmer_side_neighbor(&kmer, &data, Right);
         let r: Vec<KMer> = r.iter().map(|(k, _)| k.clone()).collect();
         assert_eq!(l, vec![new_kmer("AATCGATC"), new_kmer("GATCGATC")]);
         assert_eq!(r, vec![new_kmer("TCGATCGC"), new_kmer("TCGATCGT")]);
@@ -985,8 +1046,8 @@ AAAAAEEE
             let left_most_kmer = get_canonical(seq[..counter.kmer_len].to_vec()).0;
             let right_most_kmer =
                 get_canonical(seq[seq.len() - counter.kmer_len..seq.len()].to_vec()).0;
-            let linear_path = table[&left_most_kmer].connect.borrow_linear();
-            let linear_path_r = table[&right_most_kmer].connect.borrow_linear();
+            let linear_path = table[&left_most_kmer].connect.borrow_linear().ptr.borrow();
+            let linear_path_r = table[&right_most_kmer].connect.borrow_linear().ptr.borrow();
             assert_eq!(linear_path.path, linear_path_r.path);
             assert_eq!(linear_path.path, seq);
             assert_eq!(
