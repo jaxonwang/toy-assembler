@@ -1,5 +1,6 @@
 use fastq::{Parser, Record, RefRecord};
 use serde::{Deserialize, Serialize};
+use std::boxed::Box;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -541,14 +542,14 @@ impl SubGraph {
 
 #[derive(Clone)]
 struct GraphConnect {
-    ptr: Rc<RefCell<SubGraph>>,
+    ptr: Arc<SubGraph>,
     node_idx: usize,      // which node connect to?
     direction: Direction, // is_left -> true, which side connect to?
 }
 
 #[derive(Clone)]
 struct LinearConnect {
-    ptr: Rc<RefCell<LinearPath>>,
+    ptr: Arc<LinearPath>,
     direction: Direction,
 }
 
@@ -567,25 +568,25 @@ impl Clone for Connect {
 }
 
 impl Connect {
-    fn new_some_graph(ptr: Rc<RefCell<SubGraph>>, node_idx: usize, direction: Direction) -> Self {
+    fn new_some_graph(ptr: Arc<SubGraph>, node_idx: usize, direction: Direction) -> Self {
         Self::SomeGraph(GraphConnect {
             ptr,
             node_idx,
             direction,
         })
     }
-    fn new_some_linear(ptr: Rc<RefCell<LinearPath>>, direction: Direction) -> Self {
+    fn new_some_linear(ptr: Arc<LinearPath>, direction: Direction) -> Self {
         Self::SomeLinear(LinearConnect { ptr, direction })
     }
     #[allow(dead_code)]
-    fn unwrap_graph(self) -> Rc<RefCell<SubGraph>> {
+    fn unwrap_graph(self) -> Arc<SubGraph> {
         match self {
             Self::SomeGraph(g) => g.ptr,
             _ => panic!("Connect is not graph"),
         }
     }
     #[allow(dead_code)]
-    fn unwrap_linear(self) -> Rc<RefCell<LinearPath>> {
+    fn unwrap_linear(self) -> Arc<LinearPath> {
         match self {
             Self::SomeLinear(l) => l.ptr,
             _ => panic!("Connect is not linear"),
@@ -671,7 +672,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
 
         if lpath.len() == 0 {
             // nothing to do for this kmer, store it as SubGraph
-            let sub = Rc::new(RefCell::new(SubGraph::new_single_kmer(k, v.count)));
+            let sub = Arc::new(SubGraph::new_single_kmer(k, v.count));
             extend_table.insert(
                 k.clone(),
                 KMerExtendData {
@@ -705,7 +706,7 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
 
         let left_end_kmer = get_canonical(path[..kmer_len].to_vec()).0;
         let right_end_kmer = get_canonical(path[path.len() - kmer_len..path.len()].to_vec()).0;
-        let lp_obj = Rc::new(RefCell::new(LinearPath { path, coverage }));
+        let lp_obj = Arc::new(LinearPath { path, coverage });
         let l_kmer_data = kmers_from_counter[&left_end_kmer].clone();
         let r_kmer_data = kmers_from_counter[&right_end_kmer].clone();
         extend_table.insert(
@@ -731,19 +732,20 @@ fn local_linear_path(kmers_from_counter: CountTable, kmer_len: usize) -> KMerExt
 
 struct ContigGenerator {
     kmer_len: usize,
-    world: SystemCommunicator,
+    world: Arc<SystemCommunicator>,
     tip_minimal_coverage: f64,
     tip_minimal_length: usize,
     tip_travel_stop_length: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum TipRemovalMessageType {
-    PathExtension,
-    UnWinding,
+    CallingFrame,
+    Return,
+    Done,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct TipRemovalCallingFrame {
     callers: Vec<mpi::topology::Rank>,
     from_base: u8, // if 0 means it is the start of travel, that's a local request
@@ -752,11 +754,17 @@ struct TipRemovalCallingFrame {
     path_coverage: u32, // count for the path, not count/len
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct TipRemovalReturn {
     callers: Vec<mpi::topology::Rank>, // who to returen
     kmer: KMer,                        // this
     legal: bool,
+}
+
+enum TipRemovalMessageEnum {
+    CallingFrame(Box<TipRemovalCallingFrame>),
+    Return(Box<TipRemovalReturn>),
+    Local,
 }
 
 impl ContigGenerator {
@@ -766,60 +774,106 @@ impl ContigGenerator {
             && (path_coverage as f64 / path_len as f64) >= self.tip_minimal_coverage
     }
 
-    fn tips_travel_kmer(&self, kmer_table: Arc<KMerExtendTable>, frame: TipRemovalCallingFrame) {
+    fn tips_travel_kmer(
+        &self,
+        kmer_table: Arc<KMerExtendTable>,
+        frame: TipRemovalCallingFrame,
+        mut illegals: Arc<Mutex<Vec<KMer>>>,
+    ) {
+        use TipRemovalMessageEnum::*;
+        match self.tips_travel_kmer_logic(kmer_table, frame, illegals) {
+            CallingFrame(cf) => {
+                let mut msg = vec![];
+                TipRemovalMessageType::CallingFrame.pack(&mut msg);
+                cf.pack(&mut msg);
+                let dst = partition_by_hash(&cf.kmer, self.world.size() as usize);
+                self.world
+                    .process_at_rank(dst as mpi::topology::Rank)
+                    .send(&msg[..]);
+            }
+            Return(rf) => {
+                let mut msg = vec![];
+                TipRemovalMessageType::Return.pack(&mut msg);
+                rf.pack(&mut msg);
+                let dst = partition_by_hash(&rf.kmer, self.world.size() as usize);
+                self.world
+                    .process_at_rank(dst as mpi::topology::Rank)
+                    .send(&msg[..]);
+            }
+            Local => (),
+        };
+    }
+
+    fn tips_travel_kmer_logic(
+        &self,
+        kmer_table: Arc<KMerExtendTable>,
+        frame: TipRemovalCallingFrame,
+        mut illegals: Arc<Mutex<Vec<KMer>>>,
+    ) -> TipRemovalMessageEnum {
+        use TipRemovalMessageEnum::*;
         assert!(
             kmer_table.contains_key(&frame.kmer),
             "You asked the wrong peer!"
         );
         let ref extended_data = kmer_table[&frame.kmer];
 
-        let assemble_ret = |this_path_len, this_path_count| -> TipRemovalReturn {
+        let assemble_ret = |this_path_len, this_path_count| -> TipRemovalMessageEnum {
             let mut ret_kmer = vec![frame.from_base];
             ret_kmer.extend_from_slice(&frame.kmer[..self.kmer_len - 1]);
             let mut callers = frame.callers.clone();
-            let return_to = callers.pop(); // remove one caller
-            TipRemovalReturn {
+            Return(Box::new(TipRemovalReturn {
                 callers,
                 kmer: ret_kmer,
                 legal: self.is_legal_tip(
                     frame.path_len + this_path_len,
                     frame.path_coverage + this_path_count,
                 ),
+            }))
+        };
+
+        let mark_remove_if_illegal = |legal, kmer, mut illegals: Arc<Mutex<Vec<KMer>>>| {
+            if legal {
+                let mut list = illegals.lock().unwrap();
+                list.push(kmer);
             }
         };
 
         if adj_degree(&extended_data.kmer_data.adj) != 2 {
             // reach end
             assert!(frame.from_base != 0, "the from base can not be 0! should not get a local request when this kmer is not linear!!");
-            // TODO: send msg back
             let ret = assemble_ret(0, 0);
-            return;
-        }
+            if let Return(ref ret) = ret {
+                // mark as to remove
+                mark_remove_if_illegal(ret.legal, frame.kmer.clone(), illegals.clone());
+            }
+            return ret;
+        };
 
         let linear_connect = extended_data.connect.borrow_linear();
-        let linear_path = linear_connect.ptr.borrow();
+        let ref linear_path = linear_connect.ptr;
         let linear_path_len = linear_path.path.len();
         if linear_path_len + frame.path_len >= self.tip_travel_stop_length {
             // if is long engouh, stop traveling, return here to reduce one cross node travel
             if frame.from_base != 0 {
                 // is from remove, assemble a message
                 let ret = assemble_ret(linear_path_len, linear_path.coverage);
+                if let Return(ref ret) = ret {
+                    // mark as to remove
+                    mark_remove_if_illegal(ret.legal, frame.kmer.clone(), illegals.clone());
+                }
+                return ret;
             } else {
                 let legal = self.is_legal_tip(linear_path_len, linear_path.coverage);
-                // TODO: return legal to local
+                mark_remove_if_illegal(legal, frame.kmer.clone(), illegals.clone());
+                return Local;
             }
         }
 
-        let other_end_kmer = linear_path.get_ended_kmer(linear_connect.direction, self.kmer_len);
-        let ref other_end_kmer_data = kmer_table[&other_end_kmer].kmer_data;
+        let other_end_kmer =
+            ContigGenerator::tip_travel_to_end_kmer(kmer_table.clone(), &frame.kmer);
+        let (next_kmer, changed) =
+            ContigGenerator::tip_travel_end_to_next_hop(kmer_table.clone(), &other_end_kmer);
 
-        let neighbors = kmer_side_neighbor(
-            &other_end_kmer,
-            other_end_kmer_data,
-            linear_connect.direction,
-        );
-        assert!(neighbors.len() == 1, "out edge is not 1");
-        let (next_kmer, changed) = get_canonical(neighbors[0].0.clone());
         let mut callers = frame.callers.clone();
         callers.push(self.world.rank());
         let mut from_base = match linear_connect.direction {
@@ -836,7 +890,24 @@ impl ContigGenerator {
             path_len: linear_path_len + frame.path_len,
             path_coverage: linear_path.coverage + frame.path_coverage,
         };
-        // TODO: send call
+        TipRemovalMessageEnum::CallingFrame(Box::new(call_frame))
+    }
+
+    fn tip_travel_to_end_kmer(kmer_table: Arc<KMerExtendTable>, kmer: &KMer) -> KMer {
+        // in a local linear_path, travel from one end to the other end
+        let linear_connect = kmer_table[kmer].connect.borrow_linear();
+        let ref linear_path = linear_connect.ptr;
+        linear_path.get_ended_kmer(linear_connect.direction.reverse(), kmer.len())
+    }
+
+    fn tip_travel_end_to_next_hop(kmer_table: Arc<KMerExtendTable>, kmer: &KMer) -> (KMer, bool) {
+        // kmer is one end of a local linear_path, to get to it's contigous remote kmer
+        let ref kmer_data = kmer_table[kmer].kmer_data;
+        let linear_connect = kmer_table[kmer].connect.borrow_linear();
+        let direction = linear_connect.direction;
+        let next_hops = kmer_side_neighbor(kmer, kmer_data, direction);
+        assert!(next_hops.len() == 1, "out edge is not 1");
+        get_canonical(next_hops[0].0.clone())
     }
 
     fn remove_low_coverage_tips(&self, kmer_table: KMerExtendTable) {
@@ -857,19 +928,102 @@ impl ContigGenerator {
         }
         let low_quality_tips: Vec<Vec<KMer>> = vec![];
 
-        for (k, direction) in tip_path {
-            // NOTE: this can be paralleled
-            self.tips_travel_kmer(
-                kmer_table.clone(),
-                TipRemovalCallingFrame {
-                    callers: vec![],
-                    from_base: 0,
-                    kmer: k.clone(),
-                    path_len: 0,
-                    path_coverage: 0,
-                },
-            );
-        }
+        let mut illegals = Arc::new(Mutex::new(vec![]));
+
+        crossbeam::scope(|scope| {
+            scope.spawn(|_| self.tips_remove_msg_receiver(kmer_table.clone(), illegals.clone()));
+
+            for (k, direction) in tip_path {
+                // NOTE: this can be paralleled
+                self.tips_travel_kmer(
+                    kmer_table.clone(),
+                    TipRemovalCallingFrame {
+                        callers: vec![],
+                        from_base: 0,
+                        kmer: k.clone(),
+                        path_len: 0,
+                        path_coverage: 0,
+                    },
+                    illegals.clone(),
+                );
+            }
+            for i in 0..self.world.size() {
+                let mut msg = vec![];
+                TipRemovalMessageType::Done.pack(&mut msg);
+                self.world.process_at_rank(i).send(&msg[..]);
+            }
+        })
+        .unwrap();
+    }
+
+    fn tips_remove_msg_receiver(
+        &self,
+        kmer_table: Arc<KMerExtendTable>,
+        mut illegals: Arc<Mutex<Vec<KMer>>>,
+    ) {
+        crossbeam::scope(|scope| {
+            use TipRemovalMessageType::*;
+            let mut done = 0;
+            let world_size = self.world.size() as usize;
+
+            while done != world_size {
+                let (msg, _) = self.world.any_process().receive_vec();
+                let (msg_type, size) = TipRemovalMessageType::unpack(&msg[..]);
+                let msg_type = msg_type.unwrap();
+                match msg_type {
+                    CallingFrame => {
+                        let (frame, _) = TipRemovalCallingFrame::unpack(&msg[size..]);
+                        let frame = frame.unwrap();
+                        scope.spawn(|_| {
+                            self.tips_travel_kmer(kmer_table.clone(), frame, illegals.clone())
+                        });
+                    }
+                    Return => {
+                        let (ret, _) = TipRemovalReturn::unpack(&msg[size..]);
+                        let ret = ret.unwrap();
+                        // mark local removal
+                        if !ret.legal {
+                            debug_assert!(kmer_table.contains_key(&ret.kmer));
+                            let mut list = illegals.lock().unwrap();
+                            list.push(ret.kmer.clone());
+                        }
+                        if ret.callers.len() > 0 {
+                            // continue return
+                            let ret = ret.clone();
+                            let kmer_table = kmer_table.clone();
+                            scope.spawn(move |_| {
+                                let end = ContigGenerator::tip_travel_to_end_kmer(
+                                    kmer_table.clone(),
+                                    &ret.kmer,
+                                );
+                                let (next_hop, _) = ContigGenerator::tip_travel_end_to_next_hop(
+                                    kmer_table.clone(),
+                                    &end,
+                                );
+                                let dst = partition_by_hash(&next_hop, self.world.size() as usize);
+
+                                let ret_callers = ret.callers[..ret.callers.len() - 1].to_vec();
+                                let next_ret = TipRemovalReturn {
+                                    callers: ret_callers,
+                                    kmer: next_hop,
+                                    legal: ret.legal,
+                                };
+                                let mut msg = vec![];
+                                next_ret.pack(&mut msg);
+
+                                self.world
+                                    .process_at_rank(dst as mpi::topology::Rank)
+                                    .send(&msg[..]);
+                            });
+                        }
+                    }
+                    Done => done += 1,
+
+                    Local => panic!("should be no local request!"),
+                }
+            }
+        })
+        .unwrap();
     }
 }
 // pub fn main() {
@@ -1153,8 +1307,8 @@ AAAAAEEE
             let left_most_kmer = get_canonical(seq[..counter.kmer_len].to_vec()).0;
             let right_most_kmer =
                 get_canonical(seq[seq.len() - counter.kmer_len..seq.len()].to_vec()).0;
-            let linear_path = table[&left_most_kmer].connect.borrow_linear().ptr.borrow();
-            let linear_path_r = table[&right_most_kmer].connect.borrow_linear().ptr.borrow();
+            let ref linear_path = table[&left_most_kmer].connect.borrow_linear().ptr;
+            let ref linear_path_r = table[&right_most_kmer].connect.borrow_linear().ptr;
             assert_eq!(linear_path.path, linear_path_r.path);
             assert_eq!(linear_path.path, seq);
             assert_eq!(
@@ -1190,5 +1344,62 @@ AAAAAEEEEEEEEEEEEEEEEEEEEEEAEEEEEEEEEEEEEEEEEEEEAEAEEEEEEEEEEEEAEEEEEEEEA<EEEEEE
         };
         assert_eq!(kmer_str(&path.get_ended_kmer(Left, 5)), "ABCDE");
         assert_eq!(kmer_str(&path.get_ended_kmer(Right, 5)), "JKLMN");
+    }
+
+    #[test]
+    fn tip_travel_end_to_next_hop() {
+        let seq = "TTAAACACGGTCAGATTCGGATCGGTTTTATGCAGCGCATCCAGCTCCGG";
+        let mut kmer_table: KMerExtendTable = HashMap::new();
+        let linear_path = LinearPath {
+            path: seq.as_bytes().to_vec(),
+            coverage: 1,
+        };
+        let boxed_path = Arc::new(linear_path);
+        let kmer_left = "TTAAACACGGT".as_bytes().to_vec();
+        let kmer_right = "TCCAGCTCCGG".as_bytes().to_vec();
+        let connect = Connect::SomeLinear(LinearConnect {
+            ptr: boxed_path.clone(),
+            direction: Left,
+        });
+        kmer_table.insert(
+            kmer_left.clone(),
+            KMerExtendData {
+                kmer_data: KMerData {
+                    adj: [0, 0, 1, 0, 0, 1, 0, 0], // left G, right C
+                    count: 20,
+                },
+                connect,
+            },
+        );
+
+        let connect = Connect::SomeLinear(LinearConnect {
+            ptr: boxed_path.clone(),
+            direction: Right,
+        });
+        kmer_table.insert(
+            kmer_right.clone(),
+            KMerExtendData {
+                kmer_data: KMerData {
+                    adj: [1, 0, 0, 0, 0, 0, 1, 0], // left A right A
+                    count: 20,
+                },
+                connect,
+            },
+        );
+        let kmer_table = Arc::new(kmer_table);
+        // from left to right
+        let end_kmer = ContigGenerator::tip_travel_to_end_kmer(kmer_table.clone(), &kmer_left);
+        assert_eq!(end_kmer, kmer_right);
+        let (r, changed) = ContigGenerator::tip_travel_end_to_next_hop(kmer_table.clone(), &end_kmer);
+        assert_eq!(changed, true);
+        assert_eq!(r, "TCCGGAGCTGG".as_bytes().to_vec());
+
+        // from right to left
+        let end_kmer = ContigGenerator::tip_travel_to_end_kmer(kmer_table.clone(), &kmer_right);
+        assert_eq!(end_kmer, kmer_left);
+        let (r, changed) = ContigGenerator::tip_travel_end_to_next_hop(kmer_table.clone(), &end_kmer);
+        assert_eq!(changed, false);
+        assert_eq!(r, "GTTAAACACGG".as_bytes().to_vec());
+        
     }
 }
